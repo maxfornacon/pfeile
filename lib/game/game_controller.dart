@@ -15,15 +15,15 @@ final gameProvider = NotifierProvider<GameController, GameState>(
 /// Generation is delegated to [_BoardGenerator], which produces a board that
 /// is solvable by construction (see the class docs for the algorithm).
 class GameController extends Notifier<GameState> {
-  static const int rows = 50;
-  static const int cols = 50;
+  static const int rows = 20;
+  static const int cols = 12;
 
   // Generation parameters. Adjusting these is safe: the generator works for
   // arbitrarily large boards in linear time.
   static const int _minArrowLen = 3;
-  static const int _maxArrowLen = 3;
+  static const int _maxArrowLen = 8;
   static const int _maxBendsPerArrow = 5;
-  static const double _bendProbability = 0.22;
+  static const double _bendProbability = 0.5;
 
   final Random _random = Random();
 
@@ -212,17 +212,39 @@ class GameController extends Notifier<GameState> {
 /// would strictly reduce coverage for no gameplay benefit.
 ///
 /// Generation runs three stages:
-///   1. Primary fill — long, varied arrows (random walks with up to
-///      [maxBends] turns, tried in both orientations).
-///   2. Cleanup fill — tiny (length 2–3) arrows into small pockets, seeded
-///      from the most-constrained free cells first.
-///   3. Endpoint absorption — swallow remaining free cells into a
-///      neighboring arrow by prepending at the tail or appending at the
-///      head. Head-extension re-validates the new ray against earlier
-///      arrows.
+///   1. Boundary-seed pass — before any other placement, plant arrows on
+///      a random ~50% of boundary cells. Seeds go through the same
+///      bend-biased walk machinery as the main fill, but with *random*
+///      orientation (not longer-ray-preferred) so parallel-to-edge heads
+///      get an even chance against perpendicular-inward heads. Because
+///      the board is empty when seeds are placed, their forward rays are
+///      trivially clear regardless of orientation.
+///   2. Fill — a single pass that iterates remaining free cells sorted
+///      interior-first (distance from the nearest edge, descending) with
+///      random tiebreak. Early placements happen on a mostly-empty board
+///      and face the larger open region; unseeded edge cells come last
+///      and often cannot be placed at all.
+///   3. Endpoint absorption — swallow remaining interior free cells into
+///      a neighboring arrow. Free cells on the outermost ring are left
+///      alone so the perimeter keeps its intentional gaps.
 ///
-/// Any cells that none of the stages can absorb are left empty; the painter
-/// renders them as the usual faint background dots.
+/// Two invariants deserve special mention:
+///
+///   * **No outward-off-board heads.** Orientations whose head-forward
+///     ray has length 0 (head on boundary, direction pointing off the
+///     grid) are rejected *everywhere*, not just for seeds. That turns
+///     the spike-at-edge pattern into boundary gaps instead.
+///   * **~50% seed density.** Full-density seeding would occupy the first
+///     [maxLen] rows/cols of every edge and leave interior arrows with no
+///     valid ray direction in at least one axis.
+///
+/// The net effect: the middle of the board fills densely with bent arrows
+/// in mixed directions; the perimeter carries a mix of inward-facing and
+/// parallel-to-edge seeds plus intentional gaps, but never the regimented
+/// outward-spike row that plain reverse construction produces.
+///
+/// Any cells no stage can absorb are left empty; the painter renders them
+/// as the usual faint background dots.
 ///
 /// Complexity: each arrow does O(maxLen + rows + cols) work, so the whole
 /// generator is O(cells) — suitable for very large boards.
@@ -280,25 +302,17 @@ class _BoardGenerator {
       }
     }
 
-    // Primary pass: long, varied arrows, random order.
+    // Stage 1: seed ~50% of boundary cells with bent, randomly-oriented
+    // arrows while the board is still empty (so their forward rays are
+    // trivially clear regardless of direction).
+    _seedInwardEdgeArrows();
+
+    // Stage 2: interior-first fill for everything else.
     _fillPass(
       minLen: minLen,
       maxLen: maxLen,
-      walkAttemptsPerStart: 6,
-      preferConstrainedStarts: false,
+      walkAttemptsPerStart: 8,
     );
-
-    // Cleanup pass: tiny arrows into the remaining pockets. Seeding from the
-    // most-constrained free cells first gives the best chance of not
-    // stranding their neighbors.
-    if (_free.isNotEmpty) {
-      _fillPass(
-        minLen: 2,
-        maxLen: 3,
-        walkAttemptsPerStart: 4,
-        preferConstrainedStarts: true,
-      );
-    }
 
     // Endpoint absorption: absorb stragglers into neighboring arrows, either
     // at the tail (cheap) or at the head (re-validates the new ray).
@@ -309,19 +323,70 @@ class _BoardGenerator {
     return _arrows;
   }
 
-  /// Repeatedly sweeps through free cells, trying to grow an arrow from each.
-  /// Stops when a full sweep places nothing new. Bounded to a handful of
-  /// sweeps to keep generation fast even on huge boards.
+  /// Plants arrows on a random ~50% of the boundary cells *before* any
+  /// other placement. Delegates to [_tryBuildArrow] so seeds inherit the
+  /// same bend-biased walks as the rest of the generator (they are not
+  /// straight lines), but overrides two knobs:
+  ///
+  ///   * `preferLongerRay: false` — mid-edge boundary cells have a
+  ///     perpendicular ray of ~rows-1 and a parallel ray of ~cols/2; the
+  ///     longer-ray tiebreak would pick the perpendicular option almost
+  ///     every time, which is exactly the "spike pointing inward"
+  ///     monoculture we want to avoid. Random orientation gives parallel
+  ///     heads (arrows running *along* the edge) an even chance.
+  ///   * The global ray-0 rejection in [_tryBuildArrow] prevents any
+  ///     boundary cell from acquiring an outward-facing head. That turns
+  ///     boundary cells the seed pass skips and the fill pass can't
+  ///     legally fill into intentional gaps instead of yet more outward
+  ///     spikes.
+  ///
+  /// Seed density stops at ~50% so roughly half of each edge axis stays
+  /// empty and the fill pass retains at least one ray direction for
+  /// interior arrows.
+  void _seedInwardEdgeArrows() {
+    const density = 0.5;
+
+    final seedKeys = <int>{};
+    for (int col = 0; col < cols; col++) {
+      seedKeys.add(_keyFor(col, 0));
+      seedKeys.add(_keyFor(col, rows - 1));
+    }
+    for (int row = 0; row < rows; row++) {
+      seedKeys.add(_keyFor(0, row));
+      seedKeys.add(_keyFor(cols - 1, row));
+    }
+    final seeds = seedKeys.toList()..shuffle(random);
+
+    for (final key in seeds) {
+      if (random.nextDouble() >= density) continue;
+      if (!_free.contains(key)) continue;
+      final arrow = _tryBuildArrow(
+        startKey: key,
+        minLen: minLen,
+        maxLen: maxLen,
+        attempts: 8,
+        preferLongerRay: false,
+      );
+      if (arrow != null) _commit(arrow);
+    }
+  }
+
+  /// Repeatedly sweeps through free cells, trying to grow an arrow from
+  /// each. Cells are visited in interior-first order (distance to the
+  /// nearest edge, descending) with a random tiebreak so center cells get
+  /// first crack at placement while the board is empty and ray constraints
+  /// are trivial; edge cells are visited last, where many attempts will
+  /// fail and simply leave the cell unfilled.
   void _fillPass({
     required int minLen,
     required int maxLen,
     required int walkAttemptsPerStart,
-    required bool preferConstrainedStarts,
   }) {
     const maxSweeps = 4;
     for (int sweep = 0; sweep < maxSweeps; sweep++) {
       if (_free.isEmpty) return;
-      final startKeys = _orderedStartKeys(preferConstrainedStarts);
+      final startKeys = _free.toList()..shuffle(random);
+      startKeys.sort((a, b) => _edgeDistance(b) - _edgeDistance(a));
       var progressed = false;
       for (final startKey in startKeys) {
         if (!_free.contains(startKey)) continue;
@@ -340,69 +405,113 @@ class _BoardGenerator {
     }
   }
 
-  /// Returns free cell keys in the order the sweep should try them. When
-  /// [preferConstrained] is true, cells with fewer free neighbors come first
-  /// (Warnsdorff-like heuristic) with random tiebreak.
-  List<int> _orderedStartKeys(bool preferConstrained) {
-    final keys = _free.toList();
-    if (!preferConstrained) {
-      keys.shuffle(random);
-      return keys;
-    }
-    keys.shuffle(random);
-    keys.sort((a, b) => _freeNeighborCount(a) - _freeNeighborCount(b));
-    return keys;
-  }
-
-  int _freeNeighborCount(int key) {
+  /// Chebyshev-style distance from a cell to the nearest board edge. Cells
+  /// on the outermost ring return 0; the centermost cells return
+  /// `min(rows, cols) ~/ 2`.
+  int _edgeDistance(int key) {
     final col = key % cols;
     final row = key ~/ cols;
-    var count = 0;
-    for (final dir in _directions) {
-      final nc = col + dir.dx.toInt();
-      final nr = row + dir.dy.toInt();
-      if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
-      if (_free.contains(_keyFor(nc, nr))) count++;
-    }
-    return count;
+    var d = col;
+    final right = cols - 1 - col;
+    if (right < d) d = right;
+    if (row < d) d = row;
+    final bottom = rows - 1 - row;
+    if (bottom < d) d = bottom;
+    return d;
   }
 
-  /// Tries to produce a valid arrow starting at [startKey]. Returns null if
-  /// every attempted random walk (and both orientations of each) fails the
-  /// placement rules.
+  /// Tries to produce a valid arrow starting at [startKey]. Returns null
+  /// if every attempted random walk (and both orientations of each) fails
+  /// the placement rules.
+  ///
+  /// Orientations with a head-forward ray of length 0 — i.e. the head sits
+  /// on the boundary and points off-board — are always rejected. This is
+  /// what eliminates the "spike pointing straight off the grid" pattern:
+  /// boundary cells can still be filled, but only with heads pointing
+  /// inward or parallel to the nearest edge; cells for which neither
+  /// option validates are left as gaps.
+  ///
+  /// When [preferLongerRay] is true (the default) the orientation whose
+  /// head-forward ray is longer wins, which biases mid-board arrows to
+  /// face the larger open region. Callers that want orientation parity
+  /// (notably the seed pass) can pass `false` for a fair coin-flip
+  /// between the two valid orientations.
   List<Offset>? _tryBuildArrow({
     required int startKey,
     required int minLen,
     required int maxLen,
     required int attempts,
+    bool preferLongerRay = true,
   }) {
     final start = Offset(
       (startKey % cols).toDouble(),
       (startKey ~/ cols).toDouble(),
     );
+    // Try attempts spread across the length range, longest first, and bias
+    // the first half of each start's attempts toward heavily-bent walks.
+    // Late in generation the head direction is locked (see class doc), so
+    // the *only* visible randomness we can inject at the edges is the body
+    // shape. Preferring a bent candidate over a straight one — and only
+    // falling back to the straight one if every bent walk fails validation
+    // — is what breaks up the "spike at the boundary" look.
+    final lengthSpan = maxLen - minLen + 1;
+    final boostedBend = (bendProbability + 0.55).clamp(0.0, 0.9);
     for (int attempt = 0; attempt < attempts; attempt++) {
-      final targetLen = minLen + random.nextInt(maxLen - minLen + 1);
-      final walk = _randomWalk(start: start, targetLen: targetLen);
+      final targetLen = maxLen - (attempt % lengthSpan);
+      final useBoosted = attempt < (attempts + 1) ~/ 2;
+      final walk = _randomWalk(
+        start: start,
+        targetLen: targetLen,
+        bendProb: useBoosted ? boostedBend : bendProbability,
+      );
       if (walk.length < minLen) continue;
 
       final orientations = <List<Offset>>[
         walk,
         walk.reversed.toList(),
       ]..shuffle(random);
+      if (preferLongerRay) {
+        orientations.sort((a, b) => _rayLength(b).compareTo(_rayLength(a)));
+      }
       for (final oriented in orientations) {
+        if (_rayLength(oriented) == 0) continue;
         if (_validate(oriented)) return oriented;
       }
     }
     return null;
   }
 
+  /// Number of cells from the cell immediately past the head to the board
+  /// edge, in the head's direction. 0 when the head is already on the
+  /// boundary with its direction pointing off-board.
+  int _rayLength(List<Offset> path) {
+    if (path.length < 2) return 0;
+    final head = path.last;
+    final beforeHead = path[path.length - 2];
+    final dx = head.dx.toInt() - beforeHead.dx.toInt();
+    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+    var x = head.dx.toInt() + dx;
+    var y = head.dy.toInt() + dy;
+    var count = 0;
+    while (x >= 0 && y >= 0 && x < cols && y < rows) {
+      count++;
+      x += dx;
+      y += dy;
+    }
+    return count;
+  }
+
   /// Grows a random walk over free cells. Prefers to keep direction; turns
-  /// with probability [bendProbability], up to [maxBends] turns. Never
-  /// revisits a cell and never reverses direction.
+  /// with probability [bendProb], up to [maxBends] turns. Never revisits a
+  /// cell and never reverses direction. [bendProb] defaults to the
+  /// configured [bendProbability] but callers can override it per-walk to
+  /// push shapes toward bendier or straighter variants.
   List<Offset> _randomWalk({
     required Offset start,
     required int targetLen,
+    double? bendProb,
   }) {
+    final effectiveBend = bendProb ?? bendProbability;
     final path = <Offset>[start];
     final used = <int>{_keyFor(start.dx.toInt(), start.dy.toInt())};
     Offset? lastDir;
@@ -423,10 +532,10 @@ class _BoardGenerator {
         if (lastDir == null) {
           weight = 1.0;
         } else if (dir == lastDir) {
-          weight = 1.0 - bendProbability;
+          weight = 1.0 - effectiveBend;
         } else {
           if (bends >= maxBends) continue;
-          weight = bendProbability / 2.0;
+          weight = effectiveBend / 2.0;
         }
         if (weight <= 0) continue;
         options.add(_WalkOption(cell: next, dir: dir, weight: weight));
@@ -532,6 +641,11 @@ class _BoardGenerator {
       final freeKeys = _free.toList()..shuffle(random);
       for (final cellKey in freeKeys) {
         if (!_free.contains(cellKey)) continue;
+        // Leave the outermost ring alone: absorbing those cells is what
+        // generates the perimeter spikes we're trying to avoid. Any gap
+        // still sitting on the boundary after the fill pass is kept as a
+        // gap on purpose.
+        if (_edgeDistance(cellKey) == 0) continue;
         if (_tryAbsorbIntoNeighbor(cellKey)) progressed = true;
       }
     }
