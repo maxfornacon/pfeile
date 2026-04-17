@@ -125,6 +125,14 @@ class _GameScreenState extends ConsumerState<GameScreen>
   }
 
   void _syncRemovalFlights(GameController controller, List<Arrow> arrows) {
+    final anyRemovedInState = arrows.any((a) => a.removed);
+    if (!anyRemovedInState &&
+        (_knownRemoved.isNotEmpty || _activeFlights.isNotEmpty)) {
+      _knownRemoved.clear();
+      _activeFlights.clear();
+      if (_ticker.isActive) _ticker.stop();
+    }
+
     if (arrows.length < _knownRemoved.length) {
       _knownRemoved.clear();
       _activeFlights.clear();
@@ -201,14 +209,12 @@ class _GameScreenState extends ConsumerState<GameScreen>
 
     final boardWidth = GameController.cols * cellSize;
     final boardHeight = GameController.rows * cellSize;
-    final statusText = controller.isGameOver
-        ? 'Game Over'
-        : controller.isWin
+    final statusText = controller.isWin
         ? 'Level Cleared'
         : 'Tap free arrow heads to clear';
 
     return Scaffold(
-      appBar: AppBar(title: Text('Lives: ${state.lives}')),
+      appBar: AppBar(title: const Text('Pfeile')),
       body: Column(
         children: [
           Expanded(
@@ -257,6 +263,11 @@ class _GameScreenState extends ConsumerState<GameScreen>
           ),
           const SizedBox(height: 12),
           Text(statusText, style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          FilledButton(
+            onPressed: controller.newGame,
+            child: const Text('New Game'),
+          ),
           const SizedBox(height: 12),
         ],
       ),

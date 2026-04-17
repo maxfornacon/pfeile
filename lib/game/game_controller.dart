@@ -18,7 +18,7 @@ class GameController extends Notifier<GameState> {
 
   @override
   GameState build() {
-    return GameState(arrows: _createLevel(), lives: 3);
+    return GameState(arrows: _createLevel());
   }
 
   // -----------------------------
@@ -60,13 +60,16 @@ class GameController extends Notifier<GameState> {
     if (arrow.removed) return;
 
     if (!isArrowTappable(index)) {
-      state = state.copyWith(lives: (state.lives - 1).clamp(0, 999));
       return;
     }
 
     arrows[index] = arrow.copyWith(removed: true);
 
     state = state.copyWith(arrows: arrows);
+  }
+
+  void newGame() {
+    state = GameState(arrows: _createLevel());
   }
 
   // -----------------------------
@@ -530,11 +533,6 @@ class GameController extends Notifier<GameState> {
   // 🏁 WIN
   // -----------------------------
   bool get isWin => state.arrows.every((a) => a.removed);
-
-  // -----------------------------
-  // 💀 GAME OVER
-  // -----------------------------
-  bool get isGameOver => state.lives <= 0;
 }
 
 class _WeightedCell {
