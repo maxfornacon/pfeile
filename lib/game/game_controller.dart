@@ -25,19 +25,23 @@ class GameController extends Notifier<GameState> {
   // 🎮 LEVEL
   // -----------------------------
   List<Arrow> _createLevel() {
-    final fullPath = _buildSerpentinePath();
-    final arrows = <Arrow>[];
-    int cursor = 0;
+    const maxAttempts = 300;
 
-    while (cursor < fullPath.length) {
-      final remaining = fullPath.length - cursor;
-      final length = _chooseArrowLength(remaining);
-      final segment = fullPath.sublist(cursor, cursor + length);
-      arrows.add(Arrow(points: _compressSegmentToPolyline(segment)));
-      cursor += length;
+    for (int attempt = 0; attempt < maxAttempts; attempt++) {
+      final candidate = _generateArrowCellPaths();
+      if (_passesOppositeFacingRule(candidate) &&
+          _passesNoSelfBiteRule(candidate) &&
+          _isBoardSolvable(candidate)) {
+        return candidate
+            .map((cells) => Arrow(points: _compressSegmentToPolyline(cells)))
+            .toList();
+      }
     }
 
-    return arrows;
+    // Safe fallback: always solvable by construction.
+    return _buildGuaranteedSolvablePaths()
+        .map((cells) => Arrow(points: _compressSegmentToPolyline(cells)))
+        .toList();
   }
 
   // -----------------------------
@@ -167,31 +171,341 @@ class GameController extends Notifier<GameState> {
     return '$col:$row';
   }
 
-  List<Offset> _buildSerpentinePath() {
-    final path = <Offset>[];
+  List<List<Offset>> _generateArrowCellPaths() {
+    final free = <int>{};
     for (int row = 0; row < rows; row++) {
-      if (row.isEven) {
-        for (int col = 0; col < cols; col++) {
-          path.add(Offset(col.toDouble(), row.toDouble()));
+      for (int col = 0; col < cols; col++) {
+        free.add(_cellKeyInt(col, row));
+      }
+    }
+
+    final paths = <List<Offset>>[];
+
+    while (free.isNotEmpty) {
+      final start = _pickStartCell(free);
+      final targetLen = _chooseArrowLength(free.length);
+      final path = <Offset>[start];
+      free.remove(_cellKeyInt(start.dx.toInt(), start.dy.toInt()));
+
+      while (path.length < targetLen) {
+        final next = _pickNextCell(path, free);
+        if (next == null) {
+          break;
         }
-      } else {
-        for (int col = cols - 1; col >= 0; col--) {
-          path.add(Offset(col.toDouble(), row.toDouble()));
+        path.add(next);
+        free.remove(_cellKeyInt(next.dx.toInt(), next.dy.toInt()));
+      }
+
+      paths.add(path);
+    }
+
+    return _mergeSingletons(paths);
+  }
+
+  bool _passesOppositeFacingRule(List<List<Offset>> paths) {
+    final horizontalDirectionsByRow = <int, Set<int>>{};
+    final verticalDirectionsByCol = <int, Set<int>>{};
+
+    for (final path in paths) {
+      if (path.length < 2) continue;
+
+      final head = path.last;
+      final beforeHead = path[path.length - 2];
+      final dx = head.dx.toInt() - beforeHead.dx.toInt();
+      final dy = head.dy.toInt() - beforeHead.dy.toInt();
+
+      if (dx != 0) {
+        final row = head.dy.toInt();
+        final dir = dx > 0 ? 1 : -1;
+        horizontalDirectionsByRow.putIfAbsent(row, () => <int>{}).add(dir);
+        if (horizontalDirectionsByRow[row]!.length > 1) {
+          return false;
+        }
+      } else if (dy != 0) {
+        final col = head.dx.toInt();
+        final dir = dy > 0 ? 1 : -1;
+        verticalDirectionsByCol.putIfAbsent(col, () => <int>{}).add(dir);
+        if (verticalDirectionsByCol[col]!.length > 1) {
+          return false;
         }
       }
     }
-    return path;
+
+    return true;
+  }
+
+  bool _passesNoSelfBiteRule(List<List<Offset>> paths) {
+    for (final cells in paths) {
+      if (_hasSelfBite(cells)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool _hasSelfBite(List<Offset> cells) {
+    if (cells.length < 2) return false;
+
+    final head = cells.last;
+    final beforeHead = cells[cells.length - 2];
+    final direction = head - beforeHead;
+    final stepX = direction.dx.toInt();
+    final stepY = direction.dy.toInt();
+
+    final ownCells = <int>{};
+    for (final cell in cells) {
+      ownCells.add(_cellKeyInt(cell.dx.toInt(), cell.dy.toInt()));
+    }
+
+    var x = head.dx.toInt() + stepX;
+    var y = head.dy.toInt() + stepY;
+
+    while (x >= 0 && y >= 0 && x < cols && y < rows) {
+      if (ownCells.contains(_cellKeyInt(x, y))) {
+        return true;
+      }
+      x += stepX;
+      y += stepY;
+    }
+
+    return false;
+  }
+
+  bool _isBoardSolvable(List<List<Offset>> paths) {
+    final removed = <int>{};
+
+    while (removed.length < paths.length) {
+      final occupancy = _buildPathOccupancy(paths, removed);
+      var progressed = false;
+
+      for (int i = 0; i < paths.length; i++) {
+        if (removed.contains(i)) continue;
+        if (_isPathTappable(i, paths, removed, occupancy)) {
+          removed.add(i);
+          progressed = true;
+        }
+      }
+
+      if (!progressed) return false;
+    }
+
+    return true;
+  }
+
+  Map<int, List<int>> _buildPathOccupancy(
+    List<List<Offset>> paths,
+    Set<int> removed,
+  ) {
+    final occupancy = <int, List<int>>{};
+    for (int i = 0; i < paths.length; i++) {
+      if (removed.contains(i)) continue;
+      for (final cell in paths[i]) {
+        final key = _cellKeyInt(cell.dx.toInt(), cell.dy.toInt());
+        occupancy.putIfAbsent(key, () => <int>[]).add(i);
+      }
+    }
+    return occupancy;
+  }
+
+  bool _isPathTappable(
+    int index,
+    List<List<Offset>> paths,
+    Set<int> removed,
+    Map<int, List<int>> occupancy,
+  ) {
+    if (removed.contains(index)) return false;
+    final cells = paths[index];
+    if (cells.length < 2) return true;
+
+    final head = cells.last;
+    final beforeHead = cells[cells.length - 2];
+    final direction = head - beforeHead;
+    var x = head.dx.toInt() + direction.dx.toInt();
+    var y = head.dy.toInt() + direction.dy.toInt();
+    final stepX = direction.dx.toInt();
+    final stepY = direction.dy.toInt();
+
+    while (x >= 0 && y >= 0 && x < cols && y < rows) {
+      final key = _cellKeyInt(x, y);
+      final occupiedBy = occupancy[key] ?? const <int>[];
+      if (occupiedBy.any(
+        (other) => other != index && !removed.contains(other),
+      )) {
+        return false;
+      }
+      x += stepX;
+      y += stepY;
+    }
+    return true;
+  }
+
+  List<List<Offset>> _buildGuaranteedSolvablePaths() {
+    final paths = <List<Offset>>[];
+    for (int row = 0; row < rows; row++) {
+      final line = <Offset>[];
+      for (int col = 0; col < cols; col++) {
+        line.add(Offset(col.toDouble(), row.toDouble()));
+      }
+      paths.add(line);
+    }
+    return paths;
   }
 
   int _chooseArrowLength(int remaining) {
-    if (remaining <= _maxArrowLen) {
-      if (remaining == 1) return 1;
-      return remaining;
+    if (remaining <= _maxArrowLen) return remaining;
+
+    final minLen = _minArrowLen;
+    final maxLen = _maxArrowLen;
+    var length = minLen + _random.nextInt(maxLen - minLen + 1);
+
+    // Avoid leaving exactly one cell to reduce one-cell arrows.
+    if (remaining - length == 1) {
+      if (length > minLen) {
+        length -= 1;
+      } else {
+        length += 1;
+      }
+    }
+    return length;
+  }
+
+  Offset _pickStartCell(Set<int> free) {
+    var bestScore = 999;
+
+    for (final key in free) {
+      final col = key % cols;
+      final row = key ~/ cols;
+      final degree = _availableNeighbors(
+        Offset(col.toDouble(), row.toDouble()),
+        free,
+      ).length;
+      if (degree < bestScore) {
+        bestScore = degree;
+      }
     }
 
-    final maxLen = min(_maxArrowLen, remaining - _minArrowLen);
-    final minLen = _minArrowLen;
-    return minLen + _random.nextInt(maxLen - minLen + 1);
+    final candidates = <int>[];
+    for (final key in free) {
+      final col = key % cols;
+      final row = key ~/ cols;
+      final degree = _availableNeighbors(
+        Offset(col.toDouble(), row.toDouble()),
+        free,
+      ).length;
+      if (degree <= bestScore + 1) {
+        candidates.add(key);
+      }
+    }
+
+    final picked = candidates[_random.nextInt(candidates.length)];
+    return Offset((picked % cols).toDouble(), (picked ~/ cols).toDouble());
+  }
+
+  Offset? _pickNextCell(List<Offset> path, Set<int> free) {
+    final current = path.last;
+    final neighbors = _availableNeighbors(current, free);
+    if (neighbors.isEmpty) return null;
+
+    final prev = path.length > 1 ? path[path.length - 2] : null;
+    final weighted = <_WeightedCell>[];
+
+    for (final candidate in neighbors) {
+      var score = 1.0;
+
+      final candidateDegree = _availableNeighbors(candidate, free).length;
+      score += (4 - candidateDegree) * 0.35;
+
+      if (prev != null) {
+        final lastDir = current - prev;
+        final nextDir = candidate - current;
+        final isTurn = nextDir != lastDir;
+        score += isTurn ? 1.4 : 0.2;
+      }
+
+      score += _random.nextDouble() * 0.25;
+      weighted.add(
+        _WeightedCell(cell: candidate, score: score < 0.05 ? 0.05 : score),
+      );
+    }
+
+    final total = weighted.fold<double>(0, (sum, w) => sum + w.score);
+    var pick = _random.nextDouble() * total;
+    for (final item in weighted) {
+      pick -= item.score;
+      if (pick <= 0) return item.cell;
+    }
+    return weighted.last.cell;
+  }
+
+  List<Offset> _availableNeighbors(Offset cell, Set<int> free) {
+    final col = cell.dx.toInt();
+    final row = cell.dy.toInt();
+    final result = <Offset>[];
+    const deltas = <Offset>[
+      Offset(1, 0),
+      Offset(-1, 0),
+      Offset(0, 1),
+      Offset(0, -1),
+    ];
+
+    for (final delta in deltas) {
+      final nextCol = col + delta.dx.toInt();
+      final nextRow = row + delta.dy.toInt();
+      if (nextCol < 0 || nextRow < 0 || nextCol >= cols || nextRow >= rows) {
+        continue;
+      }
+      final key = _cellKeyInt(nextCol, nextRow);
+      if (free.contains(key)) {
+        result.add(Offset(nextCol.toDouble(), nextRow.toDouble()));
+      }
+    }
+    return result;
+  }
+
+  List<List<Offset>> _mergeSingletons(List<List<Offset>> paths) {
+    final result = <List<Offset>>[];
+
+    for (final path in paths) {
+      if (path.length != 1 || result.isEmpty) {
+        result.add(path);
+        continue;
+      }
+
+      final single = path.first;
+      var merged = false;
+      for (int i = 0; i < result.length; i++) {
+        final candidate = result[i];
+        final start = candidate.first;
+        final end = candidate.last;
+
+        if (_isAdjacent(single, end)) {
+          result[i] = [...candidate, single];
+          merged = true;
+          break;
+        }
+        if (_isAdjacent(single, start)) {
+          result[i] = [single, ...candidate];
+          merged = true;
+          break;
+        }
+      }
+
+      if (!merged) {
+        result.add(path);
+      }
+    }
+
+    return result;
+  }
+
+  bool _isAdjacent(Offset a, Offset b) {
+    final dx = (a.dx - b.dx).abs();
+    final dy = (a.dy - b.dy).abs();
+    return (dx == 1 && dy == 0) || (dx == 0 && dy == 1);
+  }
+
+  int _cellKeyInt(int col, int row) {
+    return row * cols + col;
   }
 
   List<Offset> _compressSegmentToPolyline(List<Offset> segment) {
@@ -221,4 +535,11 @@ class GameController extends Notifier<GameState> {
   // 💀 GAME OVER
   // -----------------------------
   bool get isGameOver => state.lives <= 0;
+}
+
+class _WeightedCell {
+  final Offset cell;
+  final double score;
+
+  const _WeightedCell({required this.cell, required this.score});
 }
