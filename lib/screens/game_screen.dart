@@ -87,6 +87,7 @@ class _GameScreenState extends ConsumerState<GameScreen>
   static const double _offBoardMarginCells = 1.0;
 
   late final Ticker _ticker;
+  late final TransformationController _viewerController;
   final Map<int, _RemovalFlight> _activeFlights = <int, _RemovalFlight>{};
   final Set<int> _knownRemoved = <int>{};
 
@@ -94,11 +95,13 @@ class _GameScreenState extends ConsumerState<GameScreen>
   void initState() {
     super.initState();
     _ticker = createTicker((_) => _tickFlights());
+    _viewerController = TransformationController();
   }
 
   @override
   void dispose() {
     _ticker.dispose();
+    _viewerController.dispose();
     super.dispose();
   }
 
@@ -206,45 +209,56 @@ class _GameScreenState extends ConsumerState<GameScreen>
 
     return Scaffold(
       appBar: AppBar(title: Text('Lives: ${state.lives}')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            GestureDetector(
-              onTapUp: (details) {
-                final boardLocal = details.localPosition;
+      body: Column(
+        children: [
+          Expanded(
+            child: ClipRect(
+              child: InteractiveViewer(
+                transformationController: _viewerController,
+                constrained: false,
+                boundaryMargin: const EdgeInsets.all(400),
+                minScale: 0.5,
+                maxScale: 4.0,
+                panEnabled: true,
+                scaleEnabled: true,
+                child: GestureDetector(
+                  onTapUp: (details) {
+                    final boardLocal = details.localPosition;
 
-                if (boardLocal.dx < 0 ||
-                    boardLocal.dy < 0 ||
-                    boardLocal.dx >= boardWidth ||
-                    boardLocal.dy >= boardHeight) {
-                  return;
-                }
+                    if (boardLocal.dx < 0 ||
+                        boardLocal.dy < 0 ||
+                        boardLocal.dx >= boardWidth ||
+                        boardLocal.dy >= boardHeight) {
+                      return;
+                    }
 
-                final col = (boardLocal.dx / cellSize).floor();
-                final row = (boardLocal.dy / cellSize).floor();
-                controller.tapCell(col, row);
-              },
-              child: SizedBox(
-                width: boardWidth,
-                height: boardHeight,
-                child: CustomPaint(
-                  painter: _BoardPainter(
-                    rows: GameController.rows,
-                    cols: GameController.cols,
-                    cellSize: cellSize,
-                    arrows: state.arrows,
-                    arrowCells: arrowCells,
-                    occupiedKeys: occupiedKeys,
-                    activeFlights: _activeFlights,
+                    final col = (boardLocal.dx / cellSize).floor();
+                    final row = (boardLocal.dy / cellSize).floor();
+                    controller.tapCell(col, row);
+                  },
+                  child: SizedBox(
+                    width: boardWidth,
+                    height: boardHeight,
+                    child: CustomPaint(
+                      painter: _BoardPainter(
+                        rows: GameController.rows,
+                        cols: GameController.cols,
+                        cellSize: cellSize,
+                        arrows: state.arrows,
+                        arrowCells: arrowCells,
+                        occupiedKeys: occupiedKeys,
+                        activeFlights: _activeFlights,
+                      ),
+                    ),
                   ),
                 ),
               ),
             ),
-            const SizedBox(height: 16),
-            Text(statusText, style: Theme.of(context).textTheme.titleMedium),
-          ],
-        ),
+          ),
+          const SizedBox(height: 12),
+          Text(statusText, style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 12),
+        ],
       ),
     );
   }
