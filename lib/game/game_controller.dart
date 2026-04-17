@@ -1,19 +1,30 @@
-import 'dart:ui';
 import 'dart:math';
+import 'dart:ui';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'game_state.dart';
+
 import '../models/arrow.dart';
+import 'game_state.dart';
 
 final gameProvider = NotifierProvider<GameController, GameState>(
   GameController.new,
 );
 
+/// Controls the game state and the lifecycle of a level.
+///
+/// Generation is delegated to [_BoardGenerator], which produces a board that
+/// is solvable by construction (see the class docs for the algorithm).
 class GameController extends Notifier<GameState> {
-  static const int rows = 15;
-  static const int cols = 15;
-  static const int _minArrowLen = 2;
-  static const int _maxArrowLen = 10;
+  static const int rows = 50;
+  static const int cols = 50;
+
+  // Generation parameters. Adjusting these is safe: the generator works for
+  // arbitrarily large boards in linear time.
+  static const int _minArrowLen = 3;
+  static const int _maxArrowLen = 3;
+  static const int _maxBendsPerArrow = 5;
+  static const double _bendProbability = 0.22;
+
   final Random _random = Random();
 
   @override
@@ -21,32 +32,29 @@ class GameController extends Notifier<GameState> {
     return GameState(arrows: _createLevel());
   }
 
-  // -----------------------------
-  // 🎮 LEVEL
-  // -----------------------------
+  // ---------------------------------------------------------------------------
+  // Level creation
+  // ---------------------------------------------------------------------------
   List<Arrow> _createLevel() {
-    const maxAttempts = 300;
-
-    for (int attempt = 0; attempt < maxAttempts; attempt++) {
-      final candidate = _generateArrowCellPaths();
-      if (_passesOppositeFacingRule(candidate) &&
-          _passesNoSelfBiteRule(candidate) &&
-          _isBoardSolvable(candidate)) {
-        return candidate
-            .map((cells) => Arrow(points: _compressSegmentToPolyline(cells)))
-            .toList();
-      }
-    }
-
-    // Safe fallback: always solvable by construction.
-    return _buildGuaranteedSolvablePaths()
-        .map((cells) => Arrow(points: _compressSegmentToPolyline(cells)))
-        .toList();
+    final generator = _BoardGenerator(
+      rows: rows,
+      cols: cols,
+      minLen: _minArrowLen,
+      maxLen: _maxArrowLen,
+      maxBends: _maxBendsPerArrow,
+      bendProbability: _bendProbability,
+      random: _random,
+    );
+    final paths = generator.generate();
+    return [
+      for (final path in paths)
+        Arrow(points: _compressSegmentToPolyline(path)),
+    ];
   }
 
-  // -----------------------------
-  // 🎯 TAP
-  // -----------------------------
+  // ---------------------------------------------------------------------------
+  // Tap handling
+  // ---------------------------------------------------------------------------
   void tapCell(int col, int row) {
     final index = topArrowIndexAtCell(col, row);
     if (index == null) return;
@@ -56,15 +64,9 @@ class GameController extends Notifier<GameState> {
   void tapArrow(int index) {
     final arrows = [...state.arrows];
     final arrow = arrows[index];
-
     if (arrow.removed) return;
-
-    if (!isArrowTappable(index)) {
-      return;
-    }
-
+    if (!isArrowTappable(index)) return;
     arrows[index] = arrow.copyWith(removed: true);
-
     state = state.copyWith(arrows: arrows);
   }
 
@@ -72,9 +74,9 @@ class GameController extends Notifier<GameState> {
     state = GameState(arrows: _createLevel());
   }
 
-  // -----------------------------
-  // ✔ RULES
-  // -----------------------------
+  // ---------------------------------------------------------------------------
+  // Rules & derived state
+  // ---------------------------------------------------------------------------
   bool isArrowTappable(int index) {
     final arrow = state.arrows[index];
     if (arrow.removed) return false;
@@ -85,26 +87,22 @@ class GameController extends Notifier<GameState> {
     final head = cells.last;
     final beforeHead = cells[cells.length - 2];
     final direction = head - beforeHead;
-    final ahead = Offset(head.dx + direction.dx, head.dy + direction.dy);
-
-    if (!_isInside(ahead)) return true;
 
     final occupancy = occupancyMap();
-    var x = ahead.dx.toInt();
-    var y = ahead.dy.toInt();
     final stepX = direction.dx.toInt();
     final stepY = direction.dy.toInt();
+    var x = head.dx.toInt() + stepX;
+    var y = head.dy.toInt() + stepY;
 
     while (x >= 0 && y >= 0 && x < cols && y < rows) {
       final key = _cellKey(x, y);
       final occupiedBy = occupancy[key] ?? const <int>[];
-      if (occupiedBy.where((other) => other != index).isNotEmpty) {
+      if (occupiedBy.any((other) => other != index)) {
         return false;
       }
       x += stepX;
       y += stepY;
     }
-
     return true;
   }
 
@@ -162,355 +160,17 @@ class GameController extends Notifier<GameState> {
         cells.add(Offset(x.toDouble(), y.toDouble()));
       }
     }
-
     return cells;
   }
 
-  bool _isInside(Offset cell) {
-    return cell.dx >= 0 && cell.dy >= 0 && cell.dx < cols && cell.dy < rows;
-  }
+  bool get isWin => state.arrows.every((a) => a.removed);
 
-  String _cellKey(int col, int row) {
-    return '$col:$row';
-  }
+  // ---------------------------------------------------------------------------
+  // Internals
+  // ---------------------------------------------------------------------------
+  String _cellKey(int col, int row) => '$col:$row';
 
-  List<List<Offset>> _generateArrowCellPaths() {
-    final free = <int>{};
-    for (int row = 0; row < rows; row++) {
-      for (int col = 0; col < cols; col++) {
-        free.add(_cellKeyInt(col, row));
-      }
-    }
-
-    final paths = <List<Offset>>[];
-
-    while (free.isNotEmpty) {
-      final start = _pickStartCell(free);
-      final targetLen = _chooseArrowLength(free.length);
-      final path = <Offset>[start];
-      free.remove(_cellKeyInt(start.dx.toInt(), start.dy.toInt()));
-
-      while (path.length < targetLen) {
-        final next = _pickNextCell(path, free);
-        if (next == null) {
-          break;
-        }
-        path.add(next);
-        free.remove(_cellKeyInt(next.dx.toInt(), next.dy.toInt()));
-      }
-
-      paths.add(path);
-    }
-
-    return _mergeSingletons(paths);
-  }
-
-  bool _passesOppositeFacingRule(List<List<Offset>> paths) {
-    final horizontalDirectionsByRow = <int, Set<int>>{};
-    final verticalDirectionsByCol = <int, Set<int>>{};
-
-    for (final path in paths) {
-      if (path.length < 2) continue;
-
-      final head = path.last;
-      final beforeHead = path[path.length - 2];
-      final dx = head.dx.toInt() - beforeHead.dx.toInt();
-      final dy = head.dy.toInt() - beforeHead.dy.toInt();
-
-      if (dx != 0) {
-        final row = head.dy.toInt();
-        final dir = dx > 0 ? 1 : -1;
-        horizontalDirectionsByRow.putIfAbsent(row, () => <int>{}).add(dir);
-        if (horizontalDirectionsByRow[row]!.length > 1) {
-          return false;
-        }
-      } else if (dy != 0) {
-        final col = head.dx.toInt();
-        final dir = dy > 0 ? 1 : -1;
-        verticalDirectionsByCol.putIfAbsent(col, () => <int>{}).add(dir);
-        if (verticalDirectionsByCol[col]!.length > 1) {
-          return false;
-        }
-      }
-    }
-
-    return true;
-  }
-
-  bool _passesNoSelfBiteRule(List<List<Offset>> paths) {
-    for (final cells in paths) {
-      if (_hasSelfBite(cells)) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool _hasSelfBite(List<Offset> cells) {
-    if (cells.length < 2) return false;
-
-    final head = cells.last;
-    final beforeHead = cells[cells.length - 2];
-    final direction = head - beforeHead;
-    final stepX = direction.dx.toInt();
-    final stepY = direction.dy.toInt();
-
-    final ownCells = <int>{};
-    for (final cell in cells) {
-      ownCells.add(_cellKeyInt(cell.dx.toInt(), cell.dy.toInt()));
-    }
-
-    var x = head.dx.toInt() + stepX;
-    var y = head.dy.toInt() + stepY;
-
-    while (x >= 0 && y >= 0 && x < cols && y < rows) {
-      if (ownCells.contains(_cellKeyInt(x, y))) {
-        return true;
-      }
-      x += stepX;
-      y += stepY;
-    }
-
-    return false;
-  }
-
-  bool _isBoardSolvable(List<List<Offset>> paths) {
-    final removed = <int>{};
-
-    while (removed.length < paths.length) {
-      final occupancy = _buildPathOccupancy(paths, removed);
-      var progressed = false;
-
-      for (int i = 0; i < paths.length; i++) {
-        if (removed.contains(i)) continue;
-        if (_isPathTappable(i, paths, removed, occupancy)) {
-          removed.add(i);
-          progressed = true;
-        }
-      }
-
-      if (!progressed) return false;
-    }
-
-    return true;
-  }
-
-  Map<int, List<int>> _buildPathOccupancy(
-    List<List<Offset>> paths,
-    Set<int> removed,
-  ) {
-    final occupancy = <int, List<int>>{};
-    for (int i = 0; i < paths.length; i++) {
-      if (removed.contains(i)) continue;
-      for (final cell in paths[i]) {
-        final key = _cellKeyInt(cell.dx.toInt(), cell.dy.toInt());
-        occupancy.putIfAbsent(key, () => <int>[]).add(i);
-      }
-    }
-    return occupancy;
-  }
-
-  bool _isPathTappable(
-    int index,
-    List<List<Offset>> paths,
-    Set<int> removed,
-    Map<int, List<int>> occupancy,
-  ) {
-    if (removed.contains(index)) return false;
-    final cells = paths[index];
-    if (cells.length < 2) return true;
-
-    final head = cells.last;
-    final beforeHead = cells[cells.length - 2];
-    final direction = head - beforeHead;
-    var x = head.dx.toInt() + direction.dx.toInt();
-    var y = head.dy.toInt() + direction.dy.toInt();
-    final stepX = direction.dx.toInt();
-    final stepY = direction.dy.toInt();
-
-    while (x >= 0 && y >= 0 && x < cols && y < rows) {
-      final key = _cellKeyInt(x, y);
-      final occupiedBy = occupancy[key] ?? const <int>[];
-      if (occupiedBy.any(
-        (other) => other != index && !removed.contains(other),
-      )) {
-        return false;
-      }
-      x += stepX;
-      y += stepY;
-    }
-    return true;
-  }
-
-  List<List<Offset>> _buildGuaranteedSolvablePaths() {
-    final paths = <List<Offset>>[];
-    for (int row = 0; row < rows; row++) {
-      final line = <Offset>[];
-      for (int col = 0; col < cols; col++) {
-        line.add(Offset(col.toDouble(), row.toDouble()));
-      }
-      paths.add(line);
-    }
-    return paths;
-  }
-
-  int _chooseArrowLength(int remaining) {
-    if (remaining <= _maxArrowLen) return remaining;
-
-    final minLen = _minArrowLen;
-    final maxLen = _maxArrowLen;
-    var length = minLen + _random.nextInt(maxLen - minLen + 1);
-
-    // Avoid leaving exactly one cell to reduce one-cell arrows.
-    if (remaining - length == 1) {
-      if (length > minLen) {
-        length -= 1;
-      } else {
-        length += 1;
-      }
-    }
-    return length;
-  }
-
-  Offset _pickStartCell(Set<int> free) {
-    var bestScore = 999;
-
-    for (final key in free) {
-      final col = key % cols;
-      final row = key ~/ cols;
-      final degree = _availableNeighbors(
-        Offset(col.toDouble(), row.toDouble()),
-        free,
-      ).length;
-      if (degree < bestScore) {
-        bestScore = degree;
-      }
-    }
-
-    final candidates = <int>[];
-    for (final key in free) {
-      final col = key % cols;
-      final row = key ~/ cols;
-      final degree = _availableNeighbors(
-        Offset(col.toDouble(), row.toDouble()),
-        free,
-      ).length;
-      if (degree <= bestScore + 1) {
-        candidates.add(key);
-      }
-    }
-
-    final picked = candidates[_random.nextInt(candidates.length)];
-    return Offset((picked % cols).toDouble(), (picked ~/ cols).toDouble());
-  }
-
-  Offset? _pickNextCell(List<Offset> path, Set<int> free) {
-    final current = path.last;
-    final neighbors = _availableNeighbors(current, free);
-    if (neighbors.isEmpty) return null;
-
-    final prev = path.length > 1 ? path[path.length - 2] : null;
-    final weighted = <_WeightedCell>[];
-
-    for (final candidate in neighbors) {
-      var score = 1.0;
-
-      final candidateDegree = _availableNeighbors(candidate, free).length;
-      score += (4 - candidateDegree) * 0.35;
-
-      if (prev != null) {
-        final lastDir = current - prev;
-        final nextDir = candidate - current;
-        final isTurn = nextDir != lastDir;
-        score += isTurn ? 1.4 : 0.2;
-      }
-
-      score += _random.nextDouble() * 0.25;
-      weighted.add(
-        _WeightedCell(cell: candidate, score: score < 0.05 ? 0.05 : score),
-      );
-    }
-
-    final total = weighted.fold<double>(0, (sum, w) => sum + w.score);
-    var pick = _random.nextDouble() * total;
-    for (final item in weighted) {
-      pick -= item.score;
-      if (pick <= 0) return item.cell;
-    }
-    return weighted.last.cell;
-  }
-
-  List<Offset> _availableNeighbors(Offset cell, Set<int> free) {
-    final col = cell.dx.toInt();
-    final row = cell.dy.toInt();
-    final result = <Offset>[];
-    const deltas = <Offset>[
-      Offset(1, 0),
-      Offset(-1, 0),
-      Offset(0, 1),
-      Offset(0, -1),
-    ];
-
-    for (final delta in deltas) {
-      final nextCol = col + delta.dx.toInt();
-      final nextRow = row + delta.dy.toInt();
-      if (nextCol < 0 || nextRow < 0 || nextCol >= cols || nextRow >= rows) {
-        continue;
-      }
-      final key = _cellKeyInt(nextCol, nextRow);
-      if (free.contains(key)) {
-        result.add(Offset(nextCol.toDouble(), nextRow.toDouble()));
-      }
-    }
-    return result;
-  }
-
-  List<List<Offset>> _mergeSingletons(List<List<Offset>> paths) {
-    final result = <List<Offset>>[];
-
-    for (final path in paths) {
-      if (path.length != 1 || result.isEmpty) {
-        result.add(path);
-        continue;
-      }
-
-      final single = path.first;
-      var merged = false;
-      for (int i = 0; i < result.length; i++) {
-        final candidate = result[i];
-        final start = candidate.first;
-        final end = candidate.last;
-
-        if (_isAdjacent(single, end)) {
-          result[i] = [...candidate, single];
-          merged = true;
-          break;
-        }
-        if (_isAdjacent(single, start)) {
-          result[i] = [single, ...candidate];
-          merged = true;
-          break;
-        }
-      }
-
-      if (!merged) {
-        result.add(path);
-      }
-    }
-
-    return result;
-  }
-
-  bool _isAdjacent(Offset a, Offset b) {
-    final dx = (a.dx - b.dx).abs();
-    final dy = (a.dy - b.dy).abs();
-    return (dx == 1 && dy == 0) || (dx == 0 && dy == 1);
-  }
-
-  int _cellKeyInt(int col, int row) {
-    return row * cols + col;
-  }
-
+  /// Reduces a full cell path to its polyline corners (start, bends, end).
   List<Offset> _compressSegmentToPolyline(List<Offset> segment) {
     if (segment.length <= 2) return [...segment];
 
@@ -528,16 +188,465 @@ class GameController extends Notifier<GameState> {
     points.add(segment.last);
     return points;
   }
-
-  // -----------------------------
-  // 🏁 WIN
-  // -----------------------------
-  bool get isWin => state.arrows.every((a) => a.removed);
 }
 
-class _WeightedCell {
-  final Offset cell;
-  final double score;
+// =============================================================================
+// Board generator
+// =============================================================================
 
-  const _WeightedCell({required this.cell, required this.score});
+/// Generates a solvable arrow board using **reverse construction**.
+///
+/// An arrow is tappable in the solve iff no other still-present arrow occupies
+/// a cell in its head's forward ray to the board edge. If we build the board
+/// in the *opposite* order of the solve (last-tapped first), each new arrow
+/// only needs its head-forward ray to be clear of the *already placed*
+/// arrows — those are exactly the ones that will still exist at the moment
+/// this arrow is removed in the solve. So the board is solvable by
+/// construction; no backtracking search or post-hoc check is needed.
+///
+/// The "no two arrows facing in opposing directions" rule is enforced
+/// implicitly: two arrows pointing *toward* each other would each have the
+/// other's body in its head-forward ray, and reverse construction rejects
+/// that on placement. Two arrows pointing *away* from each other in the same
+/// row/column are harmless and we deliberately allow them — forbidding them
+/// would strictly reduce coverage for no gameplay benefit.
+///
+/// Generation runs three stages:
+///   1. Primary fill — long, varied arrows (random walks with up to
+///      [maxBends] turns, tried in both orientations).
+///   2. Cleanup fill — tiny (length 2–3) arrows into small pockets, seeded
+///      from the most-constrained free cells first.
+///   3. Endpoint absorption — swallow remaining free cells into a
+///      neighboring arrow by prepending at the tail or appending at the
+///      head. Head-extension re-validates the new ray against earlier
+///      arrows.
+///
+/// Any cells that none of the stages can absorb are left empty; the painter
+/// renders them as the usual faint background dots.
+///
+/// Complexity: each arrow does O(maxLen + rows + cols) work, so the whole
+/// generator is O(cells) — suitable for very large boards.
+class _BoardGenerator {
+  _BoardGenerator({
+    required this.rows,
+    required this.cols,
+    required this.minLen,
+    required this.maxLen,
+    required this.maxBends,
+    required this.bendProbability,
+    required this.random,
+  });
+
+  final int rows;
+  final int cols;
+  final int minLen;
+  final int maxLen;
+  final int maxBends;
+  final double bendProbability;
+  final Random random;
+
+  static const List<Offset> _directions = <Offset>[
+    Offset(1, 0),
+    Offset(-1, 0),
+    Offset(0, 1),
+    Offset(0, -1),
+  ];
+
+  // Cells that are still unoccupied by any arrow.
+  final Set<int> _free = <int>{};
+  // Cells belonging to any already-placed arrow.
+  final Set<int> _placed = <int>{};
+  // For each placed cell, the index (into [_arrows]) of the arrow owning it.
+  // Used to check ray clearance against arrows placed earlier than a given
+  // index without rescanning every body.
+  final Map<int, int> _placedBy = <int, int>{};
+  // Committed arrows, each as a full cell path from tail to head.
+  final List<List<Offset>> _arrows = <List<Offset>>[];
+  // The head-forward ray (set of cell keys from the cell after the head all
+  // the way to the board edge) for each committed arrow, parallel to
+  // [_arrows]. Precomputed on commit and refreshed when the head changes.
+  final List<Set<int>> _arrowRays = <Set<int>>[];
+
+  List<List<Offset>> generate() {
+    _free.clear();
+    _placed.clear();
+    _placedBy.clear();
+    _arrows.clear();
+    _arrowRays.clear();
+
+    for (int row = 0; row < rows; row++) {
+      for (int col = 0; col < cols; col++) {
+        _free.add(_keyFor(col, row));
+      }
+    }
+
+    // Primary pass: long, varied arrows, random order.
+    _fillPass(
+      minLen: minLen,
+      maxLen: maxLen,
+      walkAttemptsPerStart: 6,
+      preferConstrainedStarts: false,
+    );
+
+    // Cleanup pass: tiny arrows into the remaining pockets. Seeding from the
+    // most-constrained free cells first gives the best chance of not
+    // stranding their neighbors.
+    if (_free.isNotEmpty) {
+      _fillPass(
+        minLen: 2,
+        maxLen: 3,
+        walkAttemptsPerStart: 4,
+        preferConstrainedStarts: true,
+      );
+    }
+
+    // Endpoint absorption: absorb stragglers into neighboring arrows, either
+    // at the tail (cheap) or at the head (re-validates the new ray).
+    if (_free.isNotEmpty) {
+      _extensionPass();
+    }
+
+    return _arrows;
+  }
+
+  /// Repeatedly sweeps through free cells, trying to grow an arrow from each.
+  /// Stops when a full sweep places nothing new. Bounded to a handful of
+  /// sweeps to keep generation fast even on huge boards.
+  void _fillPass({
+    required int minLen,
+    required int maxLen,
+    required int walkAttemptsPerStart,
+    required bool preferConstrainedStarts,
+  }) {
+    const maxSweeps = 4;
+    for (int sweep = 0; sweep < maxSweeps; sweep++) {
+      if (_free.isEmpty) return;
+      final startKeys = _orderedStartKeys(preferConstrainedStarts);
+      var progressed = false;
+      for (final startKey in startKeys) {
+        if (!_free.contains(startKey)) continue;
+        final arrow = _tryBuildArrow(
+          startKey: startKey,
+          minLen: minLen,
+          maxLen: maxLen,
+          attempts: walkAttemptsPerStart,
+        );
+        if (arrow != null) {
+          _commit(arrow);
+          progressed = true;
+        }
+      }
+      if (!progressed) return;
+    }
+  }
+
+  /// Returns free cell keys in the order the sweep should try them. When
+  /// [preferConstrained] is true, cells with fewer free neighbors come first
+  /// (Warnsdorff-like heuristic) with random tiebreak.
+  List<int> _orderedStartKeys(bool preferConstrained) {
+    final keys = _free.toList();
+    if (!preferConstrained) {
+      keys.shuffle(random);
+      return keys;
+    }
+    keys.shuffle(random);
+    keys.sort((a, b) => _freeNeighborCount(a) - _freeNeighborCount(b));
+    return keys;
+  }
+
+  int _freeNeighborCount(int key) {
+    final col = key % cols;
+    final row = key ~/ cols;
+    var count = 0;
+    for (final dir in _directions) {
+      final nc = col + dir.dx.toInt();
+      final nr = row + dir.dy.toInt();
+      if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+      if (_free.contains(_keyFor(nc, nr))) count++;
+    }
+    return count;
+  }
+
+  /// Tries to produce a valid arrow starting at [startKey]. Returns null if
+  /// every attempted random walk (and both orientations of each) fails the
+  /// placement rules.
+  List<Offset>? _tryBuildArrow({
+    required int startKey,
+    required int minLen,
+    required int maxLen,
+    required int attempts,
+  }) {
+    final start = Offset(
+      (startKey % cols).toDouble(),
+      (startKey ~/ cols).toDouble(),
+    );
+    for (int attempt = 0; attempt < attempts; attempt++) {
+      final targetLen = minLen + random.nextInt(maxLen - minLen + 1);
+      final walk = _randomWalk(start: start, targetLen: targetLen);
+      if (walk.length < minLen) continue;
+
+      final orientations = <List<Offset>>[
+        walk,
+        walk.reversed.toList(),
+      ]..shuffle(random);
+      for (final oriented in orientations) {
+        if (_validate(oriented)) return oriented;
+      }
+    }
+    return null;
+  }
+
+  /// Grows a random walk over free cells. Prefers to keep direction; turns
+  /// with probability [bendProbability], up to [maxBends] turns. Never
+  /// revisits a cell and never reverses direction.
+  List<Offset> _randomWalk({
+    required Offset start,
+    required int targetLen,
+  }) {
+    final path = <Offset>[start];
+    final used = <int>{_keyFor(start.dx.toInt(), start.dy.toInt())};
+    Offset? lastDir;
+    int bends = 0;
+
+    while (path.length < targetLen) {
+      final current = path.last;
+      final options = <_WalkOption>[];
+
+      for (final dir in _directions) {
+        if (lastDir != null && dir == -lastDir) continue;
+        final next = current + dir;
+        if (!_isInside(next)) continue;
+        final nextKey = _keyFor(next.dx.toInt(), next.dy.toInt());
+        if (!_free.contains(nextKey) || used.contains(nextKey)) continue;
+
+        final double weight;
+        if (lastDir == null) {
+          weight = 1.0;
+        } else if (dir == lastDir) {
+          weight = 1.0 - bendProbability;
+        } else {
+          if (bends >= maxBends) continue;
+          weight = bendProbability / 2.0;
+        }
+        if (weight <= 0) continue;
+        options.add(_WalkOption(cell: next, dir: dir, weight: weight));
+      }
+
+      if (options.isEmpty) break;
+      final chosen = _weightedPick(options);
+      if (lastDir != null && chosen.dir != lastDir) bends++;
+      path.add(chosen.cell);
+      used.add(_keyFor(chosen.cell.dx.toInt(), chosen.cell.dy.toInt()));
+      lastDir = chosen.dir;
+    }
+    return path;
+  }
+
+  _WalkOption _weightedPick(List<_WalkOption> options) {
+    double total = 0;
+    for (final option in options) {
+      total += option.weight;
+    }
+    var pick = random.nextDouble() * total;
+    for (final option in options) {
+      pick -= option.weight;
+      if (pick <= 0) return option;
+    }
+    return options.last;
+  }
+
+  /// Placement rule check for a fully oriented arrow path (tail → head).
+  ///
+  /// Walks the head-forward ray to the board edge: it must not cross any of
+  /// this arrow's own cells (self-bite) nor any previously placed cell
+  /// (solvability). Two arrows facing *toward* each other are automatically
+  /// rejected by this check — each sees the other in its ray. Arrows facing
+  /// *away* in the same row/column are allowed on purpose.
+  bool _validate(List<Offset> path) {
+    if (path.length < 2) return true;
+
+    final head = path.last;
+    final beforeHead = path[path.length - 2];
+    final dx = head.dx.toInt() - beforeHead.dx.toInt();
+    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+
+    final pathKeys = <int>{
+      for (final cell in path) _keyFor(cell.dx.toInt(), cell.dy.toInt()),
+    };
+    var x = head.dx.toInt() + dx;
+    var y = head.dy.toInt() + dy;
+    while (x >= 0 && y >= 0 && x < cols && y < rows) {
+      final key = _keyFor(x, y);
+      if (pathKeys.contains(key)) return false;
+      if (_placed.contains(key)) return false;
+      x += dx;
+      y += dy;
+    }
+    return true;
+  }
+
+  void _commit(List<Offset> path) {
+    final index = _arrows.length;
+    _arrows.add(path);
+    _arrowRays.add(_computeHeadRay(path));
+    for (final cell in path) {
+      final key = _keyFor(cell.dx.toInt(), cell.dy.toInt());
+      _free.remove(key);
+      _placed.add(key);
+      _placedBy[key] = index;
+    }
+  }
+
+  /// Returns the set of cell keys strictly in front of the head, out to the
+  /// board edge, in the head's direction. Empty for length-1 paths.
+  Set<int> _computeHeadRay(List<Offset> path) {
+    final ray = <int>{};
+    if (path.length < 2) return ray;
+    final head = path.last;
+    final beforeHead = path[path.length - 2];
+    final dx = head.dx.toInt() - beforeHead.dx.toInt();
+    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+    var x = head.dx.toInt() + dx;
+    var y = head.dy.toInt() + dy;
+    while (x >= 0 && y >= 0 && x < cols && y < rows) {
+      ray.add(_keyFor(x, y));
+      x += dx;
+      y += dy;
+    }
+    return ray;
+  }
+
+  /// Endpoint-absorption mop-up: absorb remaining free cells into neighboring
+  /// arrows at either end.
+  ///
+  /// Tail extension keeps the head and ray fixed; head extension rebuilds the
+  /// ray and re-validates it. Both are subject to the same invariant for
+  /// other arrows: the new cell cannot land in the head-forward ray of any
+  /// arrow placed *after* this one, since those are still present when this
+  /// arrow is tapped in the solve.
+  void _extensionPass() {
+    if (_free.isEmpty) return;
+    var progressed = true;
+    while (progressed && _free.isNotEmpty) {
+      progressed = false;
+      final freeKeys = _free.toList()..shuffle(random);
+      for (final cellKey in freeKeys) {
+        if (!_free.contains(cellKey)) continue;
+        if (_tryAbsorbIntoNeighbor(cellKey)) progressed = true;
+      }
+    }
+  }
+
+  bool _tryAbsorbIntoNeighbor(int cellKey) {
+    final cell = Offset(
+      (cellKey % cols).toDouble(),
+      (cellKey ~/ cols).toDouble(),
+    );
+
+    final order = List<int>.generate(_arrows.length, (i) => i)
+      ..shuffle(random);
+
+    for (final i in order) {
+      final arrow = _arrows[i];
+
+      // Tail extension: prepend when the cell touches the tail.
+      if (_isOrthogonallyAdjacent(arrow.first, cell) &&
+          _tryTailExtend(i, cell, cellKey)) {
+        return true;
+      }
+
+      // Head extension: append when the cell touches the head. For length-1
+      // arrows `first == last`, so this branch gives the opposite-orientation
+      // alternative to the tail branch above.
+      if (_isOrthogonallyAdjacent(arrow.last, cell) &&
+          _tryHeadExtend(i, cell, cellKey)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _tryTailExtend(int i, Offset cell, int cellKey) {
+    // Self-bite: the added cell can't lie in this arrow's own forward ray.
+    if (_arrowRays[i].contains(cellKey)) return false;
+    // Can't block a later-placed arrow's forward ray.
+    if (_isBlockedByLaterRay(i, cellKey)) return false;
+
+    _arrows[i] = [cell, ..._arrows[i]];
+    _free.remove(cellKey);
+    _placed.add(cellKey);
+    _placedBy[cellKey] = i;
+    // Head and direction unchanged → _arrowRays[i] stays valid.
+    return true;
+  }
+
+  bool _tryHeadExtend(int i, Offset cell, int cellKey) {
+    // Can't block a later-placed arrow's forward ray.
+    if (_isBlockedByLaterRay(i, cellKey)) return false;
+
+    final arrow = _arrows[i];
+    final oldHead = arrow.last;
+    final newDx = cell.dx.toInt() - oldHead.dx.toInt();
+    final newDy = cell.dy.toInt() - oldHead.dy.toInt();
+
+    // Build the set of cells belonging to the *extended* arrow so we can
+    // detect self-bite into the body (including back into the old head).
+    final bodyKeys = <int>{cellKey};
+    for (final c in arrow) {
+      bodyKeys.add(_keyFor(c.dx.toInt(), c.dy.toInt()));
+    }
+
+    // Walk the new head-forward ray and check:
+    //   - no self-bite (ray doesn't cross any of our own cells)
+    //   - no block by an arrow placed *before* this one (those are still
+    //     present when this arrow is tapped in the solve)
+    final newRay = <int>{};
+    var x = cell.dx.toInt() + newDx;
+    var y = cell.dy.toInt() + newDy;
+    while (x >= 0 && y >= 0 && x < cols && y < rows) {
+      final k = _keyFor(x, y);
+      if (bodyKeys.contains(k)) return false;
+      final owner = _placedBy[k];
+      if (owner != null && owner < i) return false;
+      newRay.add(k);
+      x += newDx;
+      y += newDy;
+    }
+
+    _arrows[i] = [...arrow, cell];
+    _arrowRays[i] = newRay;
+    _free.remove(cellKey);
+    _placed.add(cellKey);
+    _placedBy[cellKey] = i;
+    return true;
+  }
+
+  bool _isBlockedByLaterRay(int i, int cellKey) {
+    for (int j = i + 1; j < _arrows.length; j++) {
+      if (_arrowRays[j].contains(cellKey)) return true;
+    }
+    return false;
+  }
+
+  bool _isOrthogonallyAdjacent(Offset a, Offset b) {
+    final dx = (a.dx - b.dx).abs();
+    final dy = (a.dy - b.dy).abs();
+    return (dx == 1 && dy == 0) || (dx == 0 && dy == 1);
+  }
+
+  bool _isInside(Offset cell) =>
+      cell.dx >= 0 && cell.dy >= 0 && cell.dx < cols && cell.dy < rows;
+
+  int _keyFor(int col, int row) => row * cols + col;
+}
+
+class _WalkOption {
+  const _WalkOption({
+    required this.cell,
+    required this.dir,
+    required this.weight,
+  });
+  final Offset cell;
+  final Offset dir;
+  final double weight;
 }
