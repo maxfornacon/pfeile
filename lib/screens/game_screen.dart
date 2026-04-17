@@ -5,7 +5,7 @@ import 'package:flutter/scheduler.dart';
 import '../game/game_controller.dart';
 import '../models/arrow.dart';
 
-const double cellSize = 56.0;
+const double cellSize = 32.0;
 
 Offset _pointOnExtendedArrowPath(
   List<Offset> cells,

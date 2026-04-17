@@ -10,10 +10,10 @@ final gameProvider = NotifierProvider<GameController, GameState>(
 );
 
 class GameController extends Notifier<GameState> {
-  static const int rows = 8;
-  static const int cols = 8;
+  static const int rows = 15;
+  static const int cols = 15;
   static const int _minArrowLen = 2;
-  static const int _maxArrowLen = 6;
+  static const int _maxArrowLen = 10;
   final Random _random = Random();
 
   @override
