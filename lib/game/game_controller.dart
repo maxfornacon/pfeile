@@ -19,9 +19,9 @@ final gameProvider = NotifierProvider<GameController, GameState>(
 /// [newGame].
 class GameController extends Notifier<GameState> {
   static const int rows = 50;
-  static const int cols = 50;
+  static const int cols = 40;
   static const BoardGenerationAlgorithm _defaultAlgorithm =
-      BoardGenerationAlgorithm.tiled;
+      BoardGenerationAlgorithm.tiledLegacy;
 
   final Random _random = Random();
   BoardGenerationAlgorithm _algorithm = _defaultAlgorithm;

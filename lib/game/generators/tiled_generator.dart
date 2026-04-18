@@ -3,121 +3,118 @@ import 'dart:ui';
 
 import 'board_generator.dart';
 
-/// Divide-and-conquer board generator built on per-tile Hamiltonian
-/// walks plus an explicit dependency DAG.
+/// Divide-and-conquer board generator that grows arrows as
+/// independent random self-avoiding walks.
 ///
-/// The board is split into rectangular tiles by a randomised binary
-/// space partition: each rectangle splits along its longer axis at a
-/// random position (both halves at least [minTileSide] cells thick),
-/// and rectangles already within [maxTileSide] may stop splitting
-/// early. Tile sizes vary across the board, so the result shows no
-/// regular grid lines.
+/// The board is partitioned into rectangular tiles by a randomised
+/// binary space partition (BSP): tile sides live in `[minTileSide,
+/// maxTileSide]`, so tile shapes and sizes vary across the board.
+/// Tiling is strictly a performance trick — every arrow's body stays
+/// inside the tile it was grown in, but its head ray still runs all
+/// the way across the board, so dependencies and ray crossings weave
+/// freely through the whole grid.
 ///
-/// Fill per tile (three stages):
+/// Per tile, arrows are placed one at a time and each one is an
+/// independent random walk:
 ///
-///   1. **Hamiltonian walk.** A DFS that starts from a random corner
-///      visits every cell in the tile exactly once, using a randomised
-///      direction order plus Warnsdorff's rule (prefer moves to cells
-///      with the fewest unvisited neighbours) to succeed in O(tile
-///      area) with effectively no backtracking on the tile sizes this
-///      generator produces. Rectangular grids always admit a
-///      Hamiltonian path from any corner, so this stage is total.
-///   2. **Segmentation.** The walk is cut into contiguous chunks whose
-///      lengths are drawn independently from `[minLen, maxLen]`. The
-///      segmenter never leaves a sub-[minLen] tail, so every resulting
-///      arrow has at least `minLen` cells — no length-1 "dot" arrows
-///      ever get produced, and no cell in the tile is left empty.
-///      Independent per-segment length draws give natural length
-///      diversity across a tile.
-///   3. **Orientation pick.** Each segment has two candidate
-///      orientations; zero-ray orientations (head on the global board
-///      edge pointing off-board) are kept in reserve as a fallback
-///      because they're trivially tappable — an empty ray cannot
-///      contain any other arrow, and they have no outgoing edges in
-///      the dependency graph so they can never close a cycle. For
-///      non-zero-ray orientations we consult the running dependency
-///      DAG:
+///   1. **Seed.** Pick a free cell inside the tile with the fewest
+///      remaining free neighbours (Warnsdorff-style, but on the
+///      *free* subgraph — not a Hamiltonian construction). Breaking
+///      ties at random. This fills corners and awkward leftovers
+///      first, which dramatically cuts the odds of a tiny
+///      unreachable pocket at the end.
+///   2. **Target length.** Uniform in `[minLen, maxLen]`. Uniform
+///      gives you the mix of very short and very long arrows that
+///      makes some arrows visually end up swallowed by others.
+///   3. **Growth.** Random self-avoiding walk through still-free
+///      cells. Each step:
+///        * With probability [spiralBias] pick a next cell weighted
+///          toward neighbours that touch multiple already-laid body
+///          cells — i.e. curl back onto the arrow's own tail. This
+///          is where the spirals / C-shapes / tight coils come from.
+///        * Otherwise pick uniformly at random, which produces the
+///          long sprawling snakes.
+///      Growth stops when the target length is reached or no free
+///      neighbour remains; if the walk is still below [minLen] we
+///      abandon it and try a different seed.
+///   4. **Orient + commit.** Try both walk orientations; an
+///      orientation is accepted iff it doesn't self-bite and doesn't
+///      close a cycle in the running dependency DAG (see below).
+///      Zero-ray orientations (head on the global board edge
+///      pointing off-board) are tried as a fallback — an empty ray
+///      is trivially tappable and contributes no outgoing DAG edges,
+///      so it can never cycle.
 ///
-///        * `dependsOn(seg)` — existing arrows whose bodies sit in
-///          `seg`'s head ray. Those arrows must be tapped before
-///          `seg`, so the graph gains `seg → A` for each such A.
-///        * `dependedBy(seg)` — existing arrows whose head rays cover
-///          any cell of `seg`'s body. `seg` must be tapped before
-///          them, so the graph gains `B → seg` for each such B.
+/// Dependency DAG (controls solvability):
 ///
-///      We accept the orientation iff those edges don't close a cycle
-///      — a DFS from `dependsOn`, following "depends on" edges in the
-///      current DAG, detects any path to `dependedBy` and short
-///      circuits on it. Two arrows pointing straight at each other
-///      would form a 2-cycle and are rejected automatically; that's
-///      the only pairwise rule the original game cared about, so no
-///      separate "opposing directions" check is needed.
+///   * `dependsOn(seg)` — existing arrows whose bodies sit in
+///     `seg`'s head-forward ray. Those must be tapped before `seg`,
+///     adding `seg → A` for each such A.
+///   * `dependedBy(seg)` — existing arrows whose head rays already
+///     cover any cell of `seg`'s body. `seg` must be tapped before
+///     them, adding `B → seg` for each such B.
 ///
-/// If some segment in a tile has no valid orientation the whole tile
-/// is rolled back (committed arrows for the tile removed, placed cells
-/// restored to the free pool, dependency edges unwound) and a fresh
-/// Hamiltonian walk is tried. If every per-tile retry fails, the
-/// generator restarts from an empty board — a safety net that
-/// essentially never fires in practice but keeps the "no empty cells"
-/// invariant strict.
+///   A new segment is accepted iff the added edges don't close a
+///   cycle — a BFS out of `dependsOn` following existing "depends
+///   on" edges short-circuits on any path to `dependedBy`.
 ///
-/// Bends: Hamiltonian walks have to turn repeatedly to visit every
-/// cell, and Warnsdorff's rule pushes the walker toward the tile's
-/// edges and corners early. Both biases naturally produce many 90°
-/// turns per segment, so short segments bend occasionally and long
-/// ones almost always bend at least once or twice.
+/// If a tile can't be fully filled in a given pass (e.g. a random
+/// seeding order stranded one cell between rejected orientations)
+/// we roll the whole tile back and try again with fresh random
+/// choices. If a tile truly refuses (very rare) the whole board is
+/// regenerated from scratch.
 class TiledGenerator extends BoardGenerator {
   TiledGenerator({
     required super.rows,
     required super.cols,
     required this.random,
-    this.minTileSide = 5,
-    this.maxTileSide = 15,
+    this.minTileSide = 4,
+    this.maxTileSide = 10,
     this.minLen = 2,
-    this.maxLen = 8,
-    this.tileRetries = 16,
-    this.segmentationsPerWalk = 8,
+    this.maxLen = 20,
+    this.spiralBias = 0.6,
+    this.arrowRetries = 80,
+    this.tileRetries = 12,
     this.generationRetries = 8,
-    this.hamiltonStepLimit = 200000,
   }) : assert(minTileSide >= 2),
        assert(maxTileSide >= minTileSide),
        assert(minLen >= 2, 'length-1 arrows are never produced'),
-       assert(maxLen >= minLen);
+       assert(maxLen >= minLen),
+       assert(spiralBias >= 0 && spiralBias <= 1);
 
-  /// Minimum side length (cells) for a leaf tile.
+  /// Minimum side length (in cells) of a leaf tile.
   final int minTileSide;
 
-  /// Soft upper bound on a leaf tile's side length (cells).
+  /// Soft upper bound on a leaf tile's side length. The BSP may stop
+  /// splitting early for rectangles already below this.
   final int maxTileSide;
 
-  /// Shortest arrow the generator will produce. Must be >= 2 so no
-  /// "dot" arrows are ever emitted.
+  /// Shortest arrow the generator will produce. Must be >= 2 — no
+  /// length-1 "dot" arrows are ever emitted.
   final int minLen;
 
   /// Longest arrow the generator will produce.
   final int maxLen;
 
-  /// How many Hamiltonian walks are attempted per tile before the
-  /// generator gives up on it and asks for a full restart.
+  /// Probability (0..1) that a walk's next-cell choice is biased
+  /// toward cells adjacent to the walk's own body, producing
+  /// spirals, curls and compact coils. `0` gives pure random walks
+  /// (long sprawling snakes); `1` curls every chance it gets.
+  final double spiralBias;
+
+  /// Tries per arrow placement — each try picks a fresh seed, target
+  /// length, grown walk and orientation, so the effective search
+  /// width per arrow is quite large even if the first few fail.
+  final int arrowRetries;
+
+  /// How many times a tile retries from scratch (all its arrows
+  /// rolled back) before it gives up and asks for a full board
+  /// regeneration.
   final int tileRetries;
 
-  /// How many fresh random segmentations are tried on each walk before
-  /// the walk itself is discarded. Retrying segmentation is much
-  /// cheaper than finding a new Hamiltonian path, so most bad
-  /// orientation combos get fixed at this level without rerunning the
-  /// DFS.
-  final int segmentationsPerWalk;
-
-  /// How many times the whole board is regenerated from scratch if a
-  /// tile fill bottoms out on [tileRetries]. This essentially never
-  /// happens in practice; the value is a safety net.
+  /// How many times the whole board is regenerated if a tile gives
+  /// up. Essentially never triggers on normal parameters.
   final int generationRetries;
-
-  /// Upper bound on recursive DFS steps per Hamiltonian walk attempt,
-  /// in case Warnsdorff's rule hits a pathological dead end on a
-  /// larger tile. Exceeding the budget aborts that walk and we simply
-  /// try another corner / another walk.
-  final int hamiltonStepLimit;
 
   final Random random;
 
@@ -128,33 +125,32 @@ class TiledGenerator extends BoardGenerator {
     Offset(0, -1),
   ];
 
+  // ---------------------------------------------------------------------------
+  // Board state. Reset at the top of every `generate()` attempt.
+  // ---------------------------------------------------------------------------
+
   final Set<int> _free = <int>{};
-  final Set<int> _placed = <int>{};
   final Map<int, int> _placedBy = <int, int>{};
   final List<List<Offset>> _arrows = <List<Offset>>[];
   final List<Set<int>> _arrowRays = <Set<int>>[];
-  // `_deps[i]` is the set of arrow indices arrow `i` must be tapped
-  // *after* (outgoing edges from `i` in the dependency graph).
+  // Outgoing dependency edges of arrow `i`: indices of arrows that
+  // must be tapped before `i`.
   final List<Set<int>> _deps = <Set<int>>[];
-  // Reverse spatial index: cell key → arrow indices whose head ray
-  // covers that cell. Lets us compute `dependedBy` for a new candidate
-  // in O(body length) without rescanning every ray.
+  // Reverse spatial index: cell key -> indices of arrows whose head
+  // rays cover that cell. Used for `dependedBy` in O(body length).
   final Map<int, Set<int>> _cellInRays = <int, Set<int>>{};
 
-  // Budget counter for the current Hamiltonian walk attempt — reset
-  // at the top of every `_hamiltonianWalk` call.
-  int _hamiltonSteps = 0;
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
 
   @override
   List<List<Offset>> generate() {
     for (int attempt = 0; attempt < generationRetries; attempt++) {
       _resetState();
       final tiles = _buildTiles();
-      // Shuffle first for randomness, then sort by area descending so
-      // the tiles with the most segments run while the DAG is still
-      // sparse. This dramatically reduces cycle-rejection failures on
-      // large boards, where a late-filled big tile facing a dense DAG
-      // is the dominant failure mode.
+      // Random tile order; bigger tiles first reduces cycle
+      // rejections on dense late-stage DAGs.
       tiles.shuffle(random);
       tiles.sort((a, b) => (b.w * b.h).compareTo(a.w * a.h));
       var ok = true;
@@ -166,15 +162,14 @@ class TiledGenerator extends BoardGenerator {
       }
       if (ok && _free.isEmpty) return _arrows;
     }
-    // Last-resort return of whatever we have; should be unreachable in
-    // practice. Length-1 dots are still avoided because we never
-    // commit them anywhere in this generator.
+    // Last-resort fall-through: return whatever survived. Length-1
+    // arrows are still impossible because no commit path produces
+    // them.
     return _arrows;
   }
 
   void _resetState() {
     _free.clear();
-    _placed.clear();
     _placedBy.clear();
     _arrows.clear();
     _arrowRays.clear();
@@ -188,7 +183,7 @@ class TiledGenerator extends BoardGenerator {
   }
 
   // ---------------------------------------------------------------------------
-  // Tile partition (randomised BSP)
+  // BSP tiles
   // ---------------------------------------------------------------------------
 
   List<_Tile> _buildTiles() {
@@ -204,217 +199,213 @@ class TiledGenerator extends BoardGenerator {
     required int h,
     required List<_Tile> tiles,
   }) {
-    final canSplitV = w >= minTileSide * 2;
-    final canSplitH = h >= minTileSide * 2;
-
-    if (!canSplitV && !canSplitH) {
+    final canV = w >= minTileSide * 2;
+    final canH = h >= minTileSide * 2;
+    if (!canV && !canH) {
       tiles.add(_Tile(x: x, y: y, w: w, h: h));
       return;
     }
-
     final mustSplit = w > maxTileSide || h > maxTileSide;
     if (!mustSplit) {
-      final largerSide = w > h ? w : h;
-      final headroom = (maxTileSide - largerSide + 1) / (maxTileSide + 1);
-      final stopProb = 0.45 + (headroom.clamp(0.0, 1.0) * 0.5);
+      final larger = w > h ? w : h;
+      final headroom = (maxTileSide - larger + 1) / (maxTileSide + 1);
+      final stopProb = 0.4 + headroom.clamp(0.0, 1.0) * 0.5;
       if (random.nextDouble() < stopProb) {
         tiles.add(_Tile(x: x, y: y, w: w, h: h));
         return;
       }
     }
-
-    final bool splitVertical;
-    if (canSplitV && !canSplitH) {
-      splitVertical = true;
-    } else if (!canSplitV && canSplitH) {
-      splitVertical = false;
+    final bool vertical;
+    if (canV && !canH) {
+      vertical = true;
+    } else if (!canV && canH) {
+      vertical = false;
     } else if (w > h) {
-      splitVertical = true;
+      vertical = true;
     } else if (h > w) {
-      splitVertical = false;
+      vertical = false;
     } else {
-      splitVertical = random.nextBool();
+      vertical = random.nextBool();
     }
-
-    if (splitVertical) {
+    if (vertical) {
       final lo = minTileSide;
       final hi = w - minTileSide;
-      final splitAt = lo + random.nextInt(hi - lo + 1);
-      _splitRect(x: x, y: y, w: splitAt, h: h, tiles: tiles);
-      _splitRect(x: x + splitAt, y: y, w: w - splitAt, h: h, tiles: tiles);
+      final at = lo + random.nextInt(hi - lo + 1);
+      _splitRect(x: x, y: y, w: at, h: h, tiles: tiles);
+      _splitRect(x: x + at, y: y, w: w - at, h: h, tiles: tiles);
     } else {
       final lo = minTileSide;
       final hi = h - minTileSide;
-      final splitAt = lo + random.nextInt(hi - lo + 1);
-      _splitRect(x: x, y: y, w: w, h: splitAt, tiles: tiles);
-      _splitRect(x: x, y: y + splitAt, w: w, h: h - splitAt, tiles: tiles);
+      final at = lo + random.nextInt(hi - lo + 1);
+      _splitRect(x: x, y: y, w: w, h: at, tiles: tiles);
+      _splitRect(x: x, y: y + at, w: w, h: h - at, tiles: tiles);
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Per-tile fill: Hamiltonian walk → segments → orient & commit
+  // Per-tile fill
   // ---------------------------------------------------------------------------
 
   bool _fillTile(_Tile tile) {
-    final checkpoint = _arrows.length;
-    for (int walkAttempt = 0; walkAttempt < tileRetries; walkAttempt++) {
-      final walk = _hamiltonianWalk(tile);
-      if (walk == null) continue;
-      for (int segAttempt = 0; segAttempt < segmentationsPerWalk; segAttempt++) {
-        final segments = _segmentWalk(walk);
-        if (_commitSegments(segments)) return true;
-        _rollbackTo(checkpoint);
+    for (int attempt = 0; attempt < tileRetries; attempt++) {
+      final checkpoint = _arrows.length;
+      final tileFree = _tileCellSet(tile);
+      var stuck = false;
+      while (tileFree.isNotEmpty) {
+        if (!_placeOneArrow(tile, tileFree)) {
+          stuck = true;
+          break;
+        }
+      }
+      if (!stuck) return true;
+      _rollbackTo(checkpoint);
+    }
+    return false;
+  }
+
+  Set<int> _tileCellSet(_Tile tile) {
+    final s = <int>{};
+    for (int row = tile.y; row < tile.y + tile.h; row++) {
+      for (int col = tile.x; col < tile.x + tile.w; col++) {
+        s.add(_keyFor(col, row));
+      }
+    }
+    return s;
+  }
+
+  bool _placeOneArrow(_Tile tile, Set<int> tileFree) {
+    for (int trial = 0; trial < arrowRetries; trial++) {
+      final seed = _pickSeed(tileFree, tile);
+      final target = minLen + random.nextInt(maxLen - minLen + 1);
+      final walk = _growWalk(seed, target, tileFree, tile);
+      if (walk == null || walk.length < minLen) continue;
+      if (_commitSegment(walk)) {
+        for (final c in walk) {
+          tileFree.remove(_keyForCell(c));
+        }
+        return true;
       }
     }
     return false;
   }
 
-  /// Finds a Hamiltonian path through [tile] starting at one of its
-  /// corners (tried in random order). DFS uses a randomised direction
-  /// order and Warnsdorff's rule to almost always succeed without
-  /// backtracking at the tile sizes we produce.
-  List<Offset>? _hamiltonianWalk(_Tile tile) {
-    final total = tile.w * tile.h;
-    if (total < minLen) return null;
-
-    final corners = <Offset>[
-      Offset(tile.x.toDouble(), tile.y.toDouble()),
-      Offset((tile.x + tile.w - 1).toDouble(), tile.y.toDouble()),
-      Offset(tile.x.toDouble(), (tile.y + tile.h - 1).toDouble()),
-      Offset((tile.x + tile.w - 1).toDouble(), (tile.y + tile.h - 1).toDouble()),
-    ]..shuffle(random);
-
-    for (final start in corners) {
-      _hamiltonSteps = 0;
-      final path = <Offset>[];
-      final visited = <int>{};
-      if (_dfsHamilton(start, path, visited, tile, total)) return path;
+  /// Warnsdorff-style seed pick over `tileFree`: lowest free-neighbour
+  /// count wins, ties random. Crucially, this is run on the shrinking
+  /// *free* subgraph (not a Hamilton construction), so it's just a
+  /// way to tackle awkward pockets first.
+  Offset _pickSeed(Set<int> tileFree, _Tile tile) {
+    var minNeighbors = 5;
+    final mins = <int>[];
+    for (final k in tileFree) {
+      final col = k % cols;
+      final row = k ~/ cols;
+      var count = 0;
+      for (final dir in _directions) {
+        final nx = col + dir.dx.toInt();
+        final ny = row + dir.dy.toInt();
+        if (nx < tile.x ||
+            ny < tile.y ||
+            nx >= tile.x + tile.w ||
+            ny >= tile.y + tile.h) {
+          continue;
+        }
+        if (tileFree.contains(_keyFor(nx, ny))) count++;
+      }
+      if (count < minNeighbors) {
+        minNeighbors = count;
+        mins
+          ..clear()
+          ..add(k);
+      } else if (count == minNeighbors) {
+        mins.add(k);
+      }
     }
-    return null;
+    final k = mins[random.nextInt(mins.length)];
+    return Offset((k % cols).toDouble(), (k ~/ cols).toDouble());
   }
 
-  bool _dfsHamilton(
-    Offset cell,
-    List<Offset> path,
-    Set<int> visited,
+  /// Grows a random self-avoiding walk starting at [seed], staying
+  /// inside [tile] and inside the still-free cells of [tileFree].
+  /// Returns the walk or null if it couldn't reach [minLen].
+  List<Offset>? _growWalk(
+    Offset seed,
+    int target,
+    Set<int> tileFree,
     _Tile tile,
-    int total,
   ) {
-    if (++_hamiltonSteps > hamiltonStepLimit) return false;
-    path.add(cell);
-    visited.add(_keyFor(cell.dx.toInt(), cell.dy.toInt()));
-    if (path.length == total) return true;
-
-    final options = <_HamiltonMove>[];
-    for (final dir in _directions) {
-      final next = cell + dir;
-      if (!_isInsideTile(next, tile)) continue;
-      final nextKey = _keyFor(next.dx.toInt(), next.dy.toInt());
-      if (visited.contains(nextKey)) continue;
-
-      // Warnsdorff degree: unvisited neighbours of `next`. Lower
-      // degree = fewer forward options later, so we visit it first to
-      // avoid orphaning it.
-      var degree = 0;
-      for (final d2 in _directions) {
-        final nn = next + d2;
-        if (!_isInsideTile(nn, tile)) continue;
-        final nnKey = _keyFor(nn.dx.toInt(), nn.dy.toInt());
-        if (!visited.contains(nnKey)) degree++;
+    final walk = <Offset>[seed];
+    final walkCells = <int>{_keyForCell(seed)};
+    while (walk.length < target) {
+      final current = walk.last;
+      final candidates = <Offset>[];
+      for (final dir in _directions) {
+        final next = current + dir;
+        if (!_isInsideTile(next, tile)) continue;
+        final k = _keyForCell(next);
+        if (!tileFree.contains(k)) continue;
+        if (walkCells.contains(k)) continue;
+        candidates.add(next);
       }
-      options.add(_HamiltonMove(
-        cell: next,
-        degree: degree,
-        tieBreak: random.nextDouble(),
-      ));
+      if (candidates.isEmpty) break;
+      final next = random.nextDouble() < spiralBias
+          ? _spiralPick(candidates, walkCells)
+          : candidates[random.nextInt(candidates.length)];
+      walk.add(next);
+      walkCells.add(_keyForCell(next));
     }
-    options.sort((a, b) {
-      final d = a.degree.compareTo(b.degree);
-      if (d != 0) return d;
-      return a.tieBreak.compareTo(b.tieBreak);
-    });
-    for (final opt in options) {
-      if (_dfsHamilton(opt.cell, path, visited, tile, total)) return true;
-    }
-    path.removeLast();
-    visited.remove(_keyFor(cell.dx.toInt(), cell.dy.toInt()));
-    return false;
+    if (walk.length < minLen) return null;
+    return walk;
   }
 
-  /// Cuts a Hamiltonian walk into segments of length in
-  /// `[minLen, maxLen]`. Invariant: every emitted segment has at least
-  /// [minLen] cells, and every cell of [walk] ends up in exactly one
-  /// segment — so the tile is fully covered and no length-1 "dot"
-  /// arrow is possible.
-  List<List<Offset>> _segmentWalk(List<Offset> walk) {
-    final segments = <List<Offset>>[];
-    int i = 0;
-    final n = walk.length;
-    while (i < n) {
-      final remaining = n - i;
-      // Short-tail case: whatever's left becomes the final segment if
-      // it's still above the minimum. Tails smaller than minLen are
-      // impossible because the previous iteration would have forced a
-      // segment length that leaves at least `minLen` cells behind.
-      if (remaining <= maxLen) {
-        assert(remaining >= minLen);
-        segments.add(walk.sublist(i, n));
-        return segments;
+  /// Weighted pick among [candidates] that prefers cells touching
+  /// more already-laid body cells — the mechanism that produces
+  /// spirals and tight curls.
+  Offset _spiralPick(List<Offset> candidates, Set<int> walkCells) {
+    final weights = <double>[];
+    var total = 0.0;
+    for (final c in candidates) {
+      var adj = 0;
+      for (final dir in _directions) {
+        final n = c + dir;
+        if (walkCells.contains(_keyForCell(n))) adj++;
       }
-      // Otherwise pick a random length, but clip the upper end so the
-      // tail stays at least `minLen` cells long.
-      final upper = remaining - minLen < maxLen ? remaining - minLen : maxLen;
-      if (upper < minLen) {
-        // Tight parameter edge case (maxLen < 2 * minLen − 1): the
-        // remaining length is too awkward to split while keeping both
-        // halves ≥ minLen. Emit the whole remainder as one segment —
-        // it exceeds maxLen slightly, but keeping the "no empty
-        // cells, no length-1 arrows" invariant matters more.
-        segments.add(walk.sublist(i, n));
-        return segments;
-      }
-      final len = minLen + random.nextInt(upper - minLen + 1);
-      segments.add(walk.sublist(i, i + len));
-      i += len;
+      // The walk's current head is always adjacent to any legal
+      // candidate — subtract it out so the weight measures "extra
+      // tail contact".
+      adj = (adj - 1).clamp(0, 3);
+      final w = 1.0 + 2.5 * adj;
+      weights.add(w);
+      total += w;
     }
-    return segments;
+    var pick = random.nextDouble() * total;
+    for (var i = 0; i < candidates.length; i++) {
+      pick -= weights[i];
+      if (pick <= 0) return candidates[i];
+    }
+    return candidates.last;
   }
 
-  bool _commitSegments(List<List<Offset>> segments) {
-    for (final seg in segments) {
-      if (seg.length < minLen) return false;
-      if (!_commitSegment(seg)) return false;
-    }
-    return true;
-  }
+  // ---------------------------------------------------------------------------
+  // Orientation + DAG commit
+  // ---------------------------------------------------------------------------
 
   bool _commitSegment(List<Offset> seg) {
     final orientations = <List<Offset>>[seg, seg.reversed.toList()]
       ..shuffle(random);
-
-    // Pass 1: prefer orientations whose head-forward ray stays on the
-    // board (non-zero ray length). These look nicer and are the common
-    // case.
-    for (final oriented in orientations) {
-      if (_rayLength(oriented) == 0) continue;
-      if (_tryCommitOrientation(oriented)) return true;
+    // Prefer orientations whose head-forward ray stays on the board.
+    for (final o in orientations) {
+      if (_rayLength(o) == 0) continue;
+      if (_tryCommit(o)) return true;
     }
-    // Pass 2: fall back to zero-ray orientations — head on the global
-    // board edge with its direction pointing off-board. The tap rule
-    // is satisfied trivially (empty ray cannot contain any "other
-    // still-present arrow"), and zero-ray arrows have empty
-    // `dependsOn`, so they have no outgoing edges in the DAG and
-    // therefore cannot close a cycle. This is what lets every
-    // Hamiltonian walk fit — corner tiles whose walks end at a board
-    // corner always have at least one orientation in this bucket.
-    for (final oriented in orientations) {
-      if (_rayLength(oriented) != 0) continue;
-      if (_tryCommitOrientation(oriented)) return true;
+    // Zero-ray fallback — always safe (no outgoing DAG edges).
+    for (final o in orientations) {
+      if (_rayLength(o) != 0) continue;
+      if (_tryCommit(o)) return true;
     }
     return false;
   }
 
-  bool _tryCommitOrientation(List<Offset> oriented) {
+  bool _tryCommit(List<Offset> oriented) {
     if (!_noSelfBite(oriented)) return false;
     final dependsOn = _computeDependsOn(oriented);
     final dependedBy = _computeDependedBy(oriented);
@@ -430,11 +421,11 @@ class TiledGenerator extends BoardGenerator {
   bool _noSelfBite(List<Offset> path) {
     if (path.length < 2) return true;
     final head = path.last;
-    final beforeHead = path[path.length - 2];
-    final dx = head.dx.toInt() - beforeHead.dx.toInt();
-    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+    final before = path[path.length - 2];
+    final dx = head.dx.toInt() - before.dx.toInt();
+    final dy = head.dy.toInt() - before.dy.toInt();
     final bodyKeys = <int>{
-      for (final cell in path) _keyFor(cell.dx.toInt(), cell.dy.toInt()),
+      for (final cell in path) _keyForCell(cell),
     };
     var x = head.dx.toInt() + dx;
     var y = head.dy.toInt() + dy;
@@ -450,9 +441,9 @@ class TiledGenerator extends BoardGenerator {
     final deps = <int>{};
     if (path.length < 2) return deps;
     final head = path.last;
-    final beforeHead = path[path.length - 2];
-    final dx = head.dx.toInt() - beforeHead.dx.toInt();
-    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+    final before = path[path.length - 2];
+    final dx = head.dx.toInt() - before.dx.toInt();
+    final dy = head.dy.toInt() - before.dy.toInt();
     var x = head.dx.toInt() + dx;
     var y = head.dy.toInt() + dy;
     while (x >= 0 && y >= 0 && x < cols && y < rows) {
@@ -467,7 +458,7 @@ class TiledGenerator extends BoardGenerator {
   Set<int> _computeDependedBy(List<Offset> path) {
     final deps = <int>{};
     for (final cell in path) {
-      final owners = _cellInRays[_keyFor(cell.dx.toInt(), cell.dy.toInt())];
+      final owners = _cellInRays[_keyForCell(cell)];
       if (owners != null) deps.addAll(owners);
     }
     return deps;
@@ -496,11 +487,9 @@ class TiledGenerator extends BoardGenerator {
     final ray = _computeHeadRay(path);
     _arrowRays.add(ray);
     _deps.add(<int>{...dependsOn});
-
     for (final cell in path) {
-      final key = _keyFor(cell.dx.toInt(), cell.dy.toInt());
+      final key = _keyForCell(cell);
       _free.remove(key);
-      _placed.add(key);
       _placedBy[key] = index;
     }
     for (final j in dependedBy) {
@@ -511,12 +500,6 @@ class TiledGenerator extends BoardGenerator {
     }
   }
 
-  /// Unwinds every commit newer than [checkpoint], restoring the
-  /// generator's state exactly to how it was before the current tile
-  /// started filling. Removes cells from [_placed]/[_placedBy] back
-  /// into [_free], drops ray entries from [_cellInRays], and strips
-  /// references to the unwound arrow indices from every surviving
-  /// entry of [_deps].
   void _rollbackTo(int checkpoint) {
     while (_arrows.length > checkpoint) {
       final idx = _arrows.length - 1;
@@ -524,9 +507,8 @@ class TiledGenerator extends BoardGenerator {
       final ray = _arrowRays.removeLast();
       _deps.removeLast();
       for (final cell in path) {
-        final key = _keyFor(cell.dx.toInt(), cell.dy.toInt());
+        final key = _keyForCell(cell);
         _free.add(key);
-        _placed.remove(key);
         _placedBy.remove(key);
       }
       for (final rayKey in ray) {
@@ -535,19 +517,23 @@ class TiledGenerator extends BoardGenerator {
         set.remove(idx);
         if (set.isEmpty) _cellInRays.remove(rayKey);
       }
-      for (int j = 0; j < _deps.length; j++) {
+      for (var j = 0; j < _deps.length; j++) {
         _deps[j].remove(idx);
       }
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Geometry helpers
+  // ---------------------------------------------------------------------------
+
   Set<int> _computeHeadRay(List<Offset> path) {
     final ray = <int>{};
     if (path.length < 2) return ray;
     final head = path.last;
-    final beforeHead = path[path.length - 2];
-    final dx = head.dx.toInt() - beforeHead.dx.toInt();
-    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+    final before = path[path.length - 2];
+    final dx = head.dx.toInt() - before.dx.toInt();
+    final dy = head.dy.toInt() - before.dy.toInt();
     var x = head.dx.toInt() + dx;
     var y = head.dy.toInt() + dy;
     while (x >= 0 && y >= 0 && x < cols && y < rows) {
@@ -561,9 +547,9 @@ class TiledGenerator extends BoardGenerator {
   int _rayLength(List<Offset> path) {
     if (path.length < 2) return 0;
     final head = path.last;
-    final beforeHead = path[path.length - 2];
-    final dx = head.dx.toInt() - beforeHead.dx.toInt();
-    final dy = head.dy.toInt() - beforeHead.dy.toInt();
+    final before = path[path.length - 2];
+    final dx = head.dx.toInt() - before.dx.toInt();
+    final dy = head.dy.toInt() - before.dy.toInt();
     var x = head.dx.toInt() + dx;
     var y = head.dy.toInt() + dy;
     var count = 0;
@@ -582,23 +568,18 @@ class TiledGenerator extends BoardGenerator {
   }
 
   int _keyFor(int col, int row) => row * cols + col;
+  int _keyForCell(Offset c) => c.dy.toInt() * cols + c.dx.toInt();
 }
 
 class _Tile {
-  const _Tile({required this.x, required this.y, required this.w, required this.h});
+  const _Tile({
+    required this.x,
+    required this.y,
+    required this.w,
+    required this.h,
+  });
   final int x;
   final int y;
   final int w;
   final int h;
-}
-
-class _HamiltonMove {
-  const _HamiltonMove({
-    required this.cell,
-    required this.degree,
-    required this.tieBreak,
-  });
-  final Offset cell;
-  final int degree;
-  final double tieBreak;
 }

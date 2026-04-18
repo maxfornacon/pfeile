@@ -1,6 +1,8 @@
 import 'dart:math';
 import 'dart:ui';
 
+import 'package:pfeile/game/generators/tiled_generator_legacy.dart';
+
 import 'interior_first_generator.dart';
 import 'tiled_generator.dart';
 
@@ -13,7 +15,8 @@ import 'tiled_generator.dart';
 ///      `lib/game/generators/`.
 enum BoardGenerationAlgorithm {
   interiorFirst,
-  tiled;
+  tiled,
+  tiledLegacy;
 
   /// Short human-readable name, suitable for a picker UI.
   String get label {
@@ -21,7 +24,9 @@ enum BoardGenerationAlgorithm {
       case BoardGenerationAlgorithm.interiorFirst:
         return 'Interior-first';
       case BoardGenerationAlgorithm.tiled:
-        return 'Tiled (divide & conquer)';
+        return 'Tiled random walks';
+      case BoardGenerationAlgorithm.tiledLegacy:
+        return 'Tiled random walks (legacy)';
     }
   }
 
@@ -45,6 +50,12 @@ enum BoardGenerationAlgorithm {
           rows: rows,
           cols: cols,
           random: random,
+        );
+      case BoardGenerationAlgorithm.tiledLegacy:
+        return TiledGeneratorLegacy(
+            rows: rows,
+            cols: cols,
+            random: random
         );
     }
   }
