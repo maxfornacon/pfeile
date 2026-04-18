@@ -1,3 +1,5 @@
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/scheduler.dart';
@@ -7,38 +9,145 @@ import '../models/arrow.dart';
 
 const double cellSize = 32.0;
 
-Offset _pointOnExtendedArrowPath(
-  List<Offset> cells,
-  Offset direction,
-  double position,
-) {
-  if (cells.isEmpty) return Offset.zero;
-  if (cells.length == 1) {
-    return cells.first +
-        Offset(direction.dx * position, direction.dy * position);
+/// Same corner rounding as [_BoardPainter] stroke — used for removal sampling.
+Path _buildRoundedArrowPath(List<Offset> points, double cornerRadius) {
+  final path = Path();
+  if (points.isEmpty) return path;
+  if (points.length == 1) {
+    path.moveTo(points.first.dx, points.first.dy);
+    return path;
   }
 
-  if (position <= 0) return cells.first;
+  path.moveTo(points.first.dx, points.first.dy);
+  for (int i = 1; i < points.length - 1; i++) {
+    final prev = points[i - 1];
+    final curr = points[i];
+    final next = points[i + 1];
+
+    final inVec = curr - prev;
+    final outVec = next - curr;
+    final inLen = inVec.distance;
+    final outLen = outVec.distance;
+
+    if (inLen == 0 || outLen == 0) {
+      path.lineTo(curr.dx, curr.dy);
+      continue;
+    }
+
+    final radius = cornerRadius < (inLen / 2) ? cornerRadius : (inLen / 2);
+    final clampedRadius = radius < (outLen / 2) ? radius : (outLen / 2);
+
+    final inDir = Offset(inVec.dx / inLen, inVec.dy / inLen);
+    final outDir = Offset(outVec.dx / outLen, outVec.dy / outLen);
+
+    final cornerStart = Offset(
+      curr.dx - (inDir.dx * clampedRadius),
+      curr.dy - (inDir.dy * clampedRadius),
+    );
+    final cornerEnd = Offset(
+      curr.dx + (outDir.dx * clampedRadius),
+      curr.dy + (outDir.dy * clampedRadius),
+    );
+
+    path.lineTo(cornerStart.dx, cornerStart.dy);
+    path.quadraticBezierTo(curr.dx, curr.dy, cornerEnd.dx, cornerEnd.dy);
+  }
+
+  path.lineTo(points.last.dx, points.last.dy);
+  return path;
+}
+
+List<double> _vertexDistancesAlongRoundedPath(
+  PathMetric metric,
+  List<Offset> centers,
+) {
+  final n = centers.length;
+  final result = List<double>.filled(n, 0);
+  if (n == 0) return result;
+  result[0] = 0;
+  final len = metric.length;
+  if (len <= 0) return result;
+
+  const samples = 256;
+  for (int i = 1; i < n; i++) {
+    final target = centers[i];
+    var bestD = 0.0;
+    var bestDist = double.infinity;
+    for (int s = 0; s <= samples; s++) {
+      final d = len * s / samples;
+      final pos = metric.getTangentForOffset(d)?.position;
+      if (pos == null) continue;
+      final dist = (pos - target).distance;
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestD = d;
+      }
+    }
+    result[i] = bestD < result[i - 1] ? result[i - 1] : bestD;
+  }
+  return result;
+}
+
+Offset _pointOnExtendedRoundedPathPixel(
+  List<Offset> cells,
+  Offset direction,
+  double cellSize,
+  double position,
+  PathMetric metric,
+  List<double> vertexDistances,
+) {
+  if (cells.isEmpty) return Offset.zero;
+
+  final centers = cells
+      .map(
+        (c) => Offset((c.dx + 0.5) * cellSize, (c.dy + 0.5) * cellSize),
+      )
+      .toList();
+
+  if (cells.length == 1) {
+    return centers.first +
+        Offset(direction.dx * position * cellSize, direction.dy * position * cellSize);
+  }
 
   final lastIndex = cells.length - 1;
+
+  if (position <= 0) return centers.first;
+
   if (position <= lastIndex) {
     final lower = position.floor();
     final upper = (lower + 1).clamp(0, lastIndex);
     final t = position - lower;
-    final from = cells[lower];
-    final to = cells[upper];
-    return Offset(
-      from.dx + ((to.dx - from.dx) * t),
-      from.dy + ((to.dy - from.dy) * t),
-    );
+    final d0 = vertexDistances[lower];
+    final d1 = vertexDistances[upper];
+    final dist = d0 + (d1 - d0) * t;
+    final clamped = dist.clamp(0.0, metric.length);
+    return metric.getTangentForOffset(clamped)!.position;
   }
 
   final extra = position - lastIndex;
-  final head = cells.last;
-  return Offset(
-    head.dx + (direction.dx * extra),
-    head.dy + (direction.dy * extra),
+  final endPos = metric.getTangentForOffset(metric.length)!.position;
+  return endPos +
+      Offset(direction.dx * extra * cellSize, direction.dy * extra * cellSize);
+}
+
+/// Grid coordinates along the same spine as the rounded on-screen stroke (for exit checks).
+Offset _pointOnExtendedRoundedPathGrid(
+  List<Offset> cells,
+  Offset direction,
+  double cellSize,
+  double position,
+  PathMetric metric,
+  List<double> vertexDistances,
+) {
+  final p = _pointOnExtendedRoundedPathPixel(
+    cells,
+    direction,
+    cellSize,
+    position,
+    metric,
+    vertexDistances,
   );
+  return Offset(p.dx / cellSize - 0.5, p.dy / cellSize - 0.5);
 }
 
 List<Offset> _straighteningCells(
@@ -46,32 +155,109 @@ List<Offset> _straighteningCells(
   Offset direction,
   double shift,
 ) {
+  if (cells.isEmpty) return const <Offset>[];
+  const cornerRadius = cellSize * 0.26;
+
+  if (cells.length == 1) {
+    return [
+      cells.first +
+          Offset(direction.dx * shift, direction.dy * shift),
+    ];
+  }
+
+  final pixelCenters = cells
+      .map(
+        (c) => Offset((c.dx + 0.5) * cellSize, (c.dy + 0.5) * cellSize),
+      )
+      .toList();
+  final path = _buildRoundedArrowPath(pixelCenters, cornerRadius);
+  final metric = path.computeMetrics().first;
+  final vertexDistances = _vertexDistancesAlongRoundedPath(metric, pixelCenters);
+
   return List<Offset>.generate(cells.length, (i) {
-    return _pointOnExtendedArrowPath(cells, direction, i + shift);
+    return _pointOnExtendedRoundedPathGrid(
+      cells,
+      direction,
+      cellSize,
+      i + shift,
+      metric,
+      vertexDistances,
+    );
   });
 }
 
-List<Offset> _straighteningPolyline(
+List<Offset> _removalPolylinePixelSamples(
   List<Offset> cells,
   Offset direction,
   double shift, {
   double spacing = 0.18,
 }) {
   if (cells.isEmpty) return const <Offset>[];
+  const cornerRadius = cellSize * 0.26;
+
   if (cells.length == 1) {
-    return <Offset>[_pointOnExtendedArrowPath(cells, direction, shift)];
+    final center = Offset(
+      (cells.first.dx + 0.5) * cellSize,
+      (cells.first.dy + 0.5) * cellSize,
+    );
+    return <Offset>[
+      center +
+          Offset(direction.dx * shift * cellSize, direction.dy * shift * cellSize),
+    ];
   }
+
+  final pixelCenters = cells
+      .map(
+        (c) => Offset((c.dx + 0.5) * cellSize, (c.dy + 0.5) * cellSize),
+      )
+      .toList();
+  final path = _buildRoundedArrowPath(pixelCenters, cornerRadius);
+  final metric = path.computeMetrics().first;
+  final vertexDistances = _vertexDistancesAlongRoundedPath(metric, pixelCenters);
 
   final bodyLength = (cells.length - 1).toDouble();
   final segments = (bodyLength / spacing).ceil();
   final sampleCount = segments < 1 ? 2 : segments + 1;
   final points = <Offset>[];
   for (int i = 0; i < sampleCount; i++) {
-    final t = i / (sampleCount - 1);
+    final t = sampleCount > 1 ? i / (sampleCount - 1) : 0.0;
     final pos = shift + (bodyLength * t);
-    points.add(_pointOnExtendedArrowPath(cells, direction, pos));
+    points.add(
+      _pointOnExtendedRoundedPathPixel(
+        cells,
+        direction,
+        cellSize,
+        pos,
+        metric,
+        vertexDistances,
+      ),
+    );
   }
   return points;
+}
+
+/// While an arrow slides off, keep dots hidden on cells its tail has not yet
+/// passed. [shift] matches removal sampling (grid units along the spine).
+bool _cellDotSuppressedByActiveRemoval(
+  int col,
+  int row,
+  Map<int, _RemovalFlight> activeFlights,
+  DateTime now,
+) {
+  for (final flight in activeFlights.values) {
+    final shift = flight.distanceCells * flight.progress(now);
+    final cells = flight.cells;
+    for (int i = 0; i < cells.length; i++) {
+      final c = cells[i];
+      if (c.dx.round() == col && c.dy.round() == row) {
+        if (shift < i + 1) {
+          return true;
+        }
+        break;
+      }
+    }
+  }
+  return false;
 }
 
 class GameScreen extends ConsumerStatefulWidget {
@@ -316,6 +502,9 @@ class _BoardPainter extends CustomPainter {
     for (int row = 0; row < rows; row++) {
       for (int col = 0; col < cols; col++) {
         if (occupiedKeys.contains('$col:$row')) continue;
+        if (_cellDotSuppressedByActiveRemoval(col, row, activeFlights, now)) {
+          continue;
+        }
         canvas.drawCircle(
           _cellCenter(col.toDouble(), row.toDouble()),
           2.3,
@@ -341,12 +530,12 @@ class _BoardPainter extends CustomPainter {
       final color = _palette[index % _palette.length];
       final progress = flight.progress(now);
       final shiftCells = flight.distanceCells * progress;
-      final movedCells = _straighteningPolyline(
+      final pixelSamples = _removalPolylinePixelSamples(
         flight.cells,
         flight.direction,
         shiftCells,
       );
-      _drawArrow(canvas: canvas, cells: movedCells, color: color);
+      _drawRemovalArrow(canvas: canvas, pixelSamples: pixelSamples, color: color);
     }
   }
 
@@ -370,7 +559,7 @@ class _BoardPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
 
     final centers = cells.map((cell) => _cellCenter(cell.dx, cell.dy)).toList();
-    final path = _buildRoundedPath(centers, cellSize * 0.26);
+    final path = _buildRoundedArrowPath(centers, cellSize * 0.26);
     canvas.drawPath(path, strokePaint);
 
     final head = centers.last;
@@ -384,51 +573,40 @@ class _BoardPainter extends CustomPainter {
     );
   }
 
-  Path _buildRoundedPath(List<Offset> points, double cornerRadius) {
-    final path = Path();
-    if (points.isEmpty) return path;
-    if (points.length == 1) {
-      path.moveTo(points.first.dx, points.first.dy);
-      return path;
+  void _drawRemovalArrow({
+    required Canvas canvas,
+    required List<Offset> pixelSamples,
+    required Color color,
+  }) {
+    if (pixelSamples.isEmpty) return;
+    if (pixelSamples.length == 1) {
+      final singlePaint = Paint()..color = color;
+      canvas.drawCircle(pixelSamples.first, cellSize * 0.18, singlePaint);
+      return;
     }
 
-    path.moveTo(points.first.dx, points.first.dy);
-    for (int i = 1; i < points.length - 1; i++) {
-      final prev = points[i - 1];
-      final curr = points[i];
-      final next = points[i + 1];
+    final strokePaint = Paint()
+      ..color = color
+      ..strokeWidth = cellSize * 0.14
+      ..style = PaintingStyle.stroke
+      ..strokeJoin = StrokeJoin.round
+      ..strokeCap = StrokeCap.round;
 
-      final inVec = curr - prev;
-      final outVec = next - curr;
-      final inLen = inVec.distance;
-      final outLen = outVec.distance;
-
-      if (inLen == 0 || outLen == 0) {
-        path.lineTo(curr.dx, curr.dy);
-        continue;
-      }
-
-      final radius = cornerRadius < (inLen / 2) ? cornerRadius : (inLen / 2);
-      final clampedRadius = radius < (outLen / 2) ? radius : (outLen / 2);
-
-      final inDir = Offset(inVec.dx / inLen, inVec.dy / inLen);
-      final outDir = Offset(outVec.dx / outLen, outVec.dy / outLen);
-
-      final cornerStart = Offset(
-        curr.dx - (inDir.dx * clampedRadius),
-        curr.dy - (inDir.dy * clampedRadius),
-      );
-      final cornerEnd = Offset(
-        curr.dx + (outDir.dx * clampedRadius),
-        curr.dy + (outDir.dy * clampedRadius),
-      );
-
-      path.lineTo(cornerStart.dx, cornerStart.dy);
-      path.quadraticBezierTo(curr.dx, curr.dy, cornerEnd.dx, cornerEnd.dy);
+    final path = Path()..moveTo(pixelSamples.first.dx, pixelSamples.first.dy);
+    for (int i = 1; i < pixelSamples.length; i++) {
+      path.lineTo(pixelSamples[i].dx, pixelSamples[i].dy);
     }
+    canvas.drawPath(path, strokePaint);
 
-    path.lineTo(points.last.dx, points.last.dy);
-    return path;
+    final head = pixelSamples.last;
+    final beforeHead = pixelSamples[pixelSamples.length - 2];
+    final direction = head - beforeHead;
+    _drawArrowHead(
+      canvas: canvas,
+      tipCenter: head,
+      direction: direction,
+      color: color,
+    );
   }
 
   Offset _cellCenter(double col, double row) {
@@ -477,6 +655,9 @@ class _BoardPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _BoardPainter oldDelegate) {
+    if (activeFlights.isNotEmpty || oldDelegate.activeFlights.isNotEmpty) {
+      return true;
+    }
     return oldDelegate.arrows != arrows ||
         oldDelegate.occupiedKeys != occupiedKeys ||
         oldDelegate.arrowCells != arrowCells ||

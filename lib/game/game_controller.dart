@@ -21,7 +21,7 @@ class GameController extends Notifier<GameState> {
   static const int rows = 50;
   static const int cols = 40;
   static const BoardGenerationAlgorithm _defaultAlgorithm =
-      BoardGenerationAlgorithm.tiledLegacy;
+      BoardGenerationAlgorithm.tiled;
 
   final Random _random = Random();
   BoardGenerationAlgorithm _algorithm = _defaultAlgorithm;
