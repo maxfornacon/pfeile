@@ -11,7 +11,7 @@ import '../models/arrow.dart';
 
 const double cellSize = 32.0;
 
-/// Same corner rounding as [_BoardPainter] stroke — used for removal sampling.
+/// Same corner rounding as [_ArrowsPainter] stroke — used for removal sampling.
 Path _buildRoundedArrowPath(List<Offset> points, double cornerRadius) {
   final path = Path();
   if (points.isEmpty) return path;
@@ -327,6 +327,10 @@ class _GameScreenState extends ConsumerState<GameScreen>
   DateTime? _shakeStartedAt;
   DateTime? _damageFlashStartedAt;
 
+  static const int _maxHelpLineUses = 3;
+  int _helpLineUsesLeft = _maxHelpLineUses;
+  bool _showHelpLines = false;
+
   @override
   void initState() {
     super.initState();
@@ -555,6 +559,14 @@ class _GameScreenState extends ConsumerState<GameScreen>
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(gameProvider);
+    ref.listen(gameProvider.select((s) => s.levelId), (prev, next) {
+      if (prev != null && prev != next) {
+        setState(() {
+          _helpLineUsesLeft = _maxHelpLineUses;
+          _showHelpLines = false;
+        });
+      }
+    });
     final controller = ref.read(gameProvider.notifier);
     _syncRemovalFlights(controller, state.arrows);
 
@@ -575,6 +587,32 @@ class _GameScreenState extends ConsumerState<GameScreen>
 
     return Scaffold(
       backgroundColor: Colors.white,
+      floatingActionButton: FloatingActionButton(
+        tooltip: _showHelpLines
+            ? 'Hide guide lines'
+            : 'Show guide lines ($_helpLineUsesLeft/3)',
+        onPressed: _showHelpLines
+            ? () => setState(() => _showHelpLines = false)
+            : _helpLineUsesLeft <= 0
+                ? null
+                : () => setState(() {
+                      _helpLineUsesLeft -= 1;
+                      _showHelpLines = true;
+                    }),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black54,
+        elevation: 2,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.lightbulb_outline),
+            Text(
+              '$_helpLineUsesLeft/3',
+              style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      ),
       body: Stack(
         children: [
           Column(
@@ -583,54 +621,105 @@ class _GameScreenState extends ConsumerState<GameScreen>
                 child: Transform.translate(
                   offset: _shakeOffset(DateTime.now()),
                   child: ClipRect(
-                    child: InteractiveViewer(
-                      transformationController: _viewerController,
-                      constrained: false,
-                      boundaryMargin: const EdgeInsets.all(400),
-                      minScale: 0.5,
-                      maxScale: 4.0,
-                      panEnabled: true,
-                      scaleEnabled: true,
-                      child: GestureDetector(
-                        onTapUp: (details) {
-                          final boardLocal = details.localPosition;
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final vp = constraints.biggest;
+                        final ox = (vp.width - boardWidth) / 2;
+                        final oy = (vp.height - boardHeight) / 2;
+                        final boardOrigin = Offset(ox, oy);
+                        return InteractiveViewer(
+                          transformationController: _viewerController,
+                          constrained: true,
+                          clipBehavior: Clip.none,
+                          boundaryMargin: const EdgeInsets.all(400),
+                          minScale: 0.5,
+                          maxScale: 4.0,
+                          panEnabled: true,
+                          scaleEnabled: true,
+                          child: SizedBox(
+                            width: vp.width,
+                            height: vp.height,
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              children: [
+                                Positioned(
+                                  left: ox,
+                                  top: oy,
+                                  width: boardWidth,
+                                  height: boardHeight,
+                                  child: CustomPaint(
+                                    painter: _GridPainter(
+                                      rows: GameController.rows,
+                                      cols: GameController.cols,
+                                      cellSize: cellSize,
+                                      occupancy: occupancy,
+                                      activeFlights: _activeFlights,
+                                      blockedFlights: _blockedFlights,
+                                    ),
+                                  ),
+                                ),
+                                if (_showHelpLines)
+                                  Positioned.fill(
+                                    child: IgnorePointer(
+                                      child: CustomPaint(
+                                        painter: _GuideLinesPainter(
+                                          cellSize: cellSize,
+                                          arrows: state.arrows,
+                                          arrowCells: arrowCells,
+                                          activeFlights: _activeFlights,
+                                          blockedFlights: _blockedFlights,
+                                          boardOrigin: boardOrigin,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                Positioned(
+                                  left: ox,
+                                  top: oy,
+                                  width: boardWidth,
+                                  height: boardHeight,
+                                  child: GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTapUp: (details) {
+                                      final boardLocal = details.localPosition;
 
-                          if (boardLocal.dx < 0 ||
-                              boardLocal.dy < 0 ||
-                              boardLocal.dx >= boardWidth ||
-                              boardLocal.dy >= boardHeight) {
-                            return;
-                          }
+                                      final col =
+                                          (boardLocal.dx / cellSize).floor();
+                                      final row =
+                                          (boardLocal.dy / cellSize).floor();
+                                      final tappedIndex = controller
+                                          .topArrowIndexAtCell(col, row);
+                                      if (tappedIndex == null) return;
 
-                          final col = (boardLocal.dx / cellSize).floor();
-                          final row = (boardLocal.dy / cellSize).floor();
-                          final tappedIndex =
-                              controller.topArrowIndexAtCell(col, row);
-                          if (tappedIndex == null) return;
+                                      if (_showHelpLines) {
+                                        setState(() => _showHelpLines = false);
+                                      }
 
-                          if (controller.tapCell(col, row)) {
-                            HapticFeedback.mediumImpact();
-                            return;
-                          }
-                          _startBlockedSlide(tappedIndex, controller);
-                        },
-                        child: SizedBox(
-                          width: boardWidth,
-                          height: boardHeight,
-                          child: CustomPaint(
-                            painter: _BoardPainter(
-                              rows: GameController.rows,
-                              cols: GameController.cols,
-                              cellSize: cellSize,
-                              arrows: state.arrows,
-                              arrowCells: arrowCells,
-                              occupancy: occupancy,
-                              activeFlights: _activeFlights,
-                              blockedFlights: _blockedFlights,
+                                      if (controller.tapCell(col, row)) {
+                                        HapticFeedback.mediumImpact();
+                                        return;
+                                      }
+                                      _startBlockedSlide(
+                                          tappedIndex, controller);
+                                    },
+                                    child: CustomPaint(
+                                      painter: _ArrowsPainter(
+                                        rows: GameController.rows,
+                                        cols: GameController.cols,
+                                        cellSize: cellSize,
+                                        arrows: state.arrows,
+                                        arrowCells: arrowCells,
+                                        activeFlights: _activeFlights,
+                                        blockedFlights: _blockedFlights,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                        ),
-                      ),
+                        );
+                      },
                     ),
                   ),
                 ),
@@ -704,35 +793,27 @@ class _DamageEdgeFlashPainter extends CustomPainter {
   }
 }
 
-class _BoardPainter extends CustomPainter {
+/// White fill + corner dots beneath guide lines and arrow strokes.
+class _GridPainter extends CustomPainter {
   final int rows;
   final int cols;
   final double cellSize;
-  final List<Arrow> arrows;
-  final Map<int, List<Offset>> arrowCells;
   final Map<String, List<int>> occupancy;
   final Map<int, _RemovalFlight> activeFlights;
   final Map<int, _BlockedSlideFlight> blockedFlights;
 
-  const _BoardPainter({
+  const _GridPainter({
     required this.rows,
     required this.cols,
     required this.cellSize,
-    required this.arrows,
-    required this.arrowCells,
     required this.occupancy,
     required this.activeFlights,
     required this.blockedFlights,
   });
 
-  static const List<Color> _palette = <Color>[
-    Colors.blue,
-    Colors.teal,
-    Colors.deepOrange,
-    Colors.purple,
-    Colors.brown,
-    Colors.indigo,
-  ];
+  Offset _cellCenter(double col, double row) {
+    return Offset((col + 0.5) * cellSize, (row + 0.5) * cellSize);
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -759,7 +840,53 @@ class _BoardPainter extends CustomPainter {
         );
       }
     }
+  }
 
+  @override
+  bool shouldRepaint(covariant _GridPainter oldDelegate) {
+    if (activeFlights.isNotEmpty || oldDelegate.activeFlights.isNotEmpty) {
+      return true;
+    }
+    if (blockedFlights.isNotEmpty || oldDelegate.blockedFlights.isNotEmpty) {
+      return true;
+    }
+    return oldDelegate.occupancy != occupancy ||
+        oldDelegate.activeFlights != activeFlights ||
+        oldDelegate.blockedFlights != blockedFlights;
+  }
+}
+
+class _ArrowsPainter extends CustomPainter {
+  final int rows;
+  final int cols;
+  final double cellSize;
+  final List<Arrow> arrows;
+  final Map<int, List<Offset>> arrowCells;
+  final Map<int, _RemovalFlight> activeFlights;
+  final Map<int, _BlockedSlideFlight> blockedFlights;
+
+  const _ArrowsPainter({
+    required this.rows,
+    required this.cols,
+    required this.cellSize,
+    required this.arrows,
+    required this.arrowCells,
+    required this.activeFlights,
+    required this.blockedFlights,
+  });
+
+  static const List<Color> _palette = <Color>[
+    Colors.blue,
+    Colors.teal,
+    Colors.deepOrange,
+    Colors.purple,
+    Colors.brown,
+    Colors.indigo,
+  ];
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final now = DateTime.now();
     for (int index = 0; index < arrows.length; index++) {
       final arrow = arrows[index];
       if (arrow.removed) continue;
@@ -915,7 +1042,7 @@ class _BoardPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _BoardPainter oldDelegate) {
+  bool shouldRepaint(covariant _ArrowsPainter oldDelegate) {
     if (activeFlights.isNotEmpty || oldDelegate.activeFlights.isNotEmpty) {
       return true;
     }
@@ -923,10 +1050,122 @@ class _BoardPainter extends CustomPainter {
       return true;
     }
     return oldDelegate.arrows != arrows ||
-        oldDelegate.occupancy != occupancy ||
         oldDelegate.arrowCells != arrowCells ||
         oldDelegate.activeFlights != activeFlights ||
         oldDelegate.blockedFlights != blockedFlights;
+  }
+}
+
+/// Straight guide rays in viewport space so they can reach the visible area edges.
+class _GuideLinesPainter extends CustomPainter {
+  final double cellSize;
+  final List<Arrow> arrows;
+  final Map<int, List<Offset>> arrowCells;
+  final Map<int, _RemovalFlight> activeFlights;
+  final Map<int, _BlockedSlideFlight> blockedFlights;
+  final Offset boardOrigin;
+
+  const _GuideLinesPainter({
+    required this.cellSize,
+    required this.arrows,
+    required this.arrowCells,
+    required this.activeFlights,
+    required this.blockedFlights,
+    required this.boardOrigin,
+  });
+
+  static const Color _lineColor = Color(0xFFCFD8DC);
+
+  Offset _cellCenter(double col, double row) {
+    return Offset((col + 0.5) * cellSize, (row + 0.5) * cellSize);
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final now = DateTime.now();
+    // Long enough to cross the whole viewport from any interior start; avoids
+    // ray/rect edge cases. Parent ClipRect still bounds what is actually visible.
+    final lineExtent = size.longestSide * 2.5;
+    final helpPaint = Paint()
+      ..color = _lineColor
+      ..strokeWidth = cellSize * 0.08 + 1.0
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    for (int index = 0; index < arrows.length; index++) {
+      final arrow = arrows[index];
+      if (arrow.removed) continue;
+      if (activeFlights.containsKey(index)) continue;
+
+      final Offset? startTipBoard;
+      final Offset unitDir;
+
+      final blocked = blockedFlights[index];
+      if (blocked != null) {
+        final shift = blocked.shiftAt(now);
+        final samples = _removalPolylinePixelSamples(
+          blocked.cells,
+          blocked.direction,
+          shift,
+        );
+        if (samples.isEmpty) continue;
+        if (samples.length == 1) {
+          unitDir = blocked.direction;
+          startTipBoard =
+              samples.first + unitDir * (cellSize * 0.33);
+        } else {
+          unitDir = blocked.direction;
+          startTipBoard = samples.last + unitDir * (cellSize * 0.33);
+        }
+      } else {
+        final cells = arrowCells[index] ?? const <Offset>[];
+        if (cells.isEmpty) continue;
+        if (cells.length >= 2) {
+          final centers = cells.map((c) => _cellCenter(c.dx, c.dy)).toList();
+          final head = centers.last;
+          final beforeHead = centers[centers.length - 2];
+          final d = head - beforeHead;
+          final len = d.distance;
+          if (len < 1e-9) continue;
+          unitDir = Offset(d.dx / len, d.dy / len);
+          startTipBoard = head + unitDir * (cellSize * 0.33);
+        } else if (arrow.points.length >= 2) {
+          final a = arrow.points[arrow.points.length - 2];
+          final b = arrow.points.last;
+          final raw = b - a;
+          final len = raw.distance;
+          if (len < 1e-9) continue;
+          unitDir = Offset(raw.dx / len, raw.dy / len);
+          final head = _cellCenter(cells.first.dx, cells.first.dy);
+          startTipBoard = head + unitDir * (cellSize * 0.33);
+        } else {
+          continue;
+        }
+      }
+
+      final startInView = boardOrigin + startTipBoard;
+      if (startInView.dx.isNaN || startInView.dy.isNaN) continue;
+      canvas.drawLine(
+        startInView,
+        startInView + unitDir * lineExtent,
+        helpPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _GuideLinesPainter oldDelegate) {
+    if (activeFlights.isNotEmpty || oldDelegate.activeFlights.isNotEmpty) {
+      return true;
+    }
+    if (blockedFlights.isNotEmpty || oldDelegate.blockedFlights.isNotEmpty) {
+      return true;
+    }
+    return oldDelegate.arrows != arrows ||
+        oldDelegate.arrowCells != arrowCells ||
+        oldDelegate.activeFlights != activeFlights ||
+        oldDelegate.blockedFlights != blockedFlights ||
+        oldDelegate.boardOrigin != boardOrigin;
   }
 }
 

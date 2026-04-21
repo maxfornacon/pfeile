@@ -32,7 +32,7 @@ class GameController extends Notifier<GameState> {
 
   @override
   GameState build() {
-    return GameState(arrows: _createLevel());
+    return GameState(arrows: _createLevel(), levelId: 1);
   }
 
   // ---------------------------------------------------------------------------
@@ -77,7 +77,8 @@ class GameController extends Notifier<GameState> {
   /// one is used.
   void newGame({BoardGenerationAlgorithm? algorithm}) {
     if (algorithm != null) _algorithm = algorithm;
-    state = GameState(arrows: _createLevel());
+    final nextId = state.levelId + 1;
+    state = GameState(arrows: _createLevel(), levelId: nextId);
   }
 
   /// Switches the active generation algorithm without starting a new
