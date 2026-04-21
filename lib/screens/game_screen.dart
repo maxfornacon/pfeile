@@ -1,8 +1,10 @@
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../game/game_controller.dart';
 import '../models/arrow.dart';
@@ -236,8 +238,24 @@ List<Offset> _removalPolylinePixelSamples(
   return points;
 }
 
+/// [shift] matches removal / blocked-slide sampling (grid units along the spine).
+bool _cellDotSuppressedByPathShift(
+  int col,
+  int row,
+  List<Offset> cells,
+  double shift,
+) {
+  for (int i = 0; i < cells.length; i++) {
+    final c = cells[i];
+    if (c.dx.round() == col && c.dy.round() == row) {
+      return shift < i + 1;
+    }
+  }
+  return false;
+}
+
 /// While an arrow slides off, keep dots hidden on cells its tail has not yet
-/// passed. [shift] matches removal sampling (grid units along the spine).
+/// passed.
 bool _cellDotSuppressedByActiveRemoval(
   int col,
   int row,
@@ -246,15 +264,37 @@ bool _cellDotSuppressedByActiveRemoval(
 ) {
   for (final flight in activeFlights.values) {
     final shift = flight.distanceCells * flight.progress(now);
-    final cells = flight.cells;
-    for (int i = 0; i < cells.length; i++) {
-      final c = cells[i];
-      if (c.dx.round() == col && c.dy.round() == row) {
-        if (shift < i + 1) {
-          return true;
-        }
-        break;
+    if (_cellDotSuppressedByPathShift(col, row, flight.cells, shift)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Static occupancy hides dots, except cells vacated by a blocked arrow's tail
+/// (still in [occupancy] but no longer covered by the sliding stroke).
+bool _occupancySuppressesDot(
+  int col,
+  int row,
+  Map<String, List<int>> occupancy,
+  Map<int, _BlockedSlideFlight> blockedFlights,
+  DateTime now,
+) {
+  final ids = occupancy['$col:$row'];
+  if (ids == null || ids.isEmpty) return false;
+  for (final id in ids) {
+    final blocked = blockedFlights[id];
+    if (blocked != null) {
+      if (_cellDotSuppressedByPathShift(
+            col,
+            row,
+            blocked.cells,
+            blocked.shiftAt(now),
+          )) {
+        return true;
       }
+    } else {
+      return true;
     }
   }
   return false;
@@ -270,12 +310,22 @@ class GameScreen extends ConsumerStatefulWidget {
 class _GameScreenState extends ConsumerState<GameScreen>
     with SingleTickerProviderStateMixin {
   static const Duration _removalDuration = Duration(milliseconds: 420);
+  static const Duration _blockedForwardDuration = Duration(milliseconds: 320);
+  static const Duration _blockedImpactPause = Duration(milliseconds: 50);
+  static const Duration _blockedReturnDuration = Duration(milliseconds: 340);
+  static const Duration _shakeDuration = Duration(milliseconds: 380);
+  static const Duration _damageFlashDuration = Duration(milliseconds: 900);
   static const double _offBoardMarginCells = 1.0;
 
   late final Ticker _ticker;
   late final TransformationController _viewerController;
   final Map<int, _RemovalFlight> _activeFlights = <int, _RemovalFlight>{};
+  final Map<int, _BlockedSlideFlight> _blockedFlights =
+      <int, _BlockedSlideFlight>{};
   final Set<int> _knownRemoved = <int>{};
+  final Set<int> _blockedImpactDone = <int>{};
+  DateTime? _shakeStartedAt;
+  DateTime? _damageFlashStartedAt;
 
   @override
   void initState() {
@@ -292,36 +342,68 @@ class _GameScreenState extends ConsumerState<GameScreen>
   }
 
   void _tickFlights() {
-    if (_activeFlights.isEmpty) {
-      _ticker.stop();
-      return;
-    }
-
     final now = DateTime.now();
-    final completed = <int>[];
-    _activeFlights.forEach((index, flight) {
-      if (flight.progress(now) >= 1.0) completed.add(index);
-    });
-    for (final index in completed) {
-      _activeFlights.remove(index);
+
+    if (_activeFlights.isNotEmpty) {
+      final completed = <int>[];
+      _activeFlights.forEach((index, flight) {
+        if (flight.progress(now) >= 1.0) completed.add(index);
+      });
+      for (final index in completed) {
+        _activeFlights.remove(index);
+      }
     }
 
-    if (_activeFlights.isEmpty) _ticker.stop();
+    if (_blockedFlights.isNotEmpty) {
+      final blockedDone = <int>[];
+      _blockedFlights.forEach((index, flight) {
+        if (!_blockedImpactDone.contains(index) &&
+            flight.forwardEnded(now)) {
+          _blockedImpactDone.add(index);
+          _shakeStartedAt = now;
+          _damageFlashStartedAt = now;
+          HapticFeedback.heavyImpact();
+        }
+        if (flight.isComplete(now)) blockedDone.add(index);
+      });
+      for (final index in blockedDone) {
+        _blockedFlights.remove(index);
+        _blockedImpactDone.remove(index);
+      }
+    }
+
+    final shakeActive = _shakeOffset(now) != Offset.zero;
+    final damageActive = _damageFlashStrength(now) > 0.001;
+    final needsTicks = _activeFlights.isNotEmpty ||
+        _blockedFlights.isNotEmpty ||
+        shakeActive ||
+        damageActive;
+    if (!needsTicks) _ticker.stop();
     setState(() {});
   }
 
   void _syncRemovalFlights(GameController controller, List<Arrow> arrows) {
     final anyRemovedInState = arrows.any((a) => a.removed);
     if (!anyRemovedInState &&
-        (_knownRemoved.isNotEmpty || _activeFlights.isNotEmpty)) {
+        (_knownRemoved.isNotEmpty ||
+            _activeFlights.isNotEmpty ||
+            _blockedFlights.isNotEmpty)) {
       _knownRemoved.clear();
       _activeFlights.clear();
+      _blockedFlights.clear();
+      _blockedImpactDone.clear();
+      _shakeStartedAt = null;
+      _damageFlashStartedAt = null;
       if (_ticker.isActive) _ticker.stop();
     }
 
     if (arrows.length < _knownRemoved.length) {
       _knownRemoved.clear();
       _activeFlights.clear();
+      _blockedFlights.clear();
+      _blockedImpactDone.clear();
+      _shakeStartedAt = null;
+      _damageFlashStartedAt = null;
     }
 
     for (int i = 0; i < arrows.length; i++) {
@@ -350,9 +432,100 @@ class _GameScreenState extends ConsumerState<GameScreen>
       _knownRemoved.add(i);
     }
 
-    final hasActive = _activeFlights.isNotEmpty;
+    final hasActive = _activeFlights.isNotEmpty || _blockedFlights.isNotEmpty;
     if (hasActive && !_ticker.isActive) _ticker.start();
-    if (!hasActive && _ticker.isActive) _ticker.stop();
+  }
+
+  double _maxShiftBeforeCollision(
+    int index,
+    List<Offset> cells,
+    Offset unitDir,
+    GameController controller,
+  ) {
+    final occupancy = controller.occupancyMap();
+    const step = 0.05;
+    var shift = 0.0;
+    var lastGood = 0.0;
+    final maxTravel =
+        cells.length + GameController.rows + GameController.cols + 4.0;
+
+    while (shift <= maxTravel) {
+      final moved = _straighteningCells(cells, unitDir, shift);
+      var collides = false;
+      for (final p in moved) {
+        final col = p.dx.round();
+        final row = p.dy.round();
+        final key = '$col:$row';
+        final ids = occupancy[key];
+        if (ids != null && ids.any((id) => id != index)) {
+          collides = true;
+          break;
+        }
+      }
+      if (collides) break;
+      lastGood = shift;
+      shift += step;
+    }
+    return lastGood;
+  }
+
+  void _startBlockedSlide(int index, GameController controller) {
+    if (_blockedFlights.containsKey(index)) return;
+    final arrow = ref.read(gameProvider).arrows[index];
+    if (arrow.removed) return;
+
+    final cells = controller.cellsForArrow(arrow);
+    if (cells.length < 2) return;
+
+    final head = cells.last;
+    final beforeHead = cells[cells.length - 2];
+    final direction = head - beforeHead;
+    final norm = direction.distance;
+    if (norm <= 0) return;
+
+    final unitDir = Offset(direction.dx / norm, direction.dy / norm);
+    final maxShift = _maxShiftBeforeCollision(index, cells, unitDir, controller);
+
+    _blockedFlights[index] = _BlockedSlideFlight(
+      cells: cells,
+      direction: unitDir,
+      maxShiftCells: maxShift,
+      startedAt: DateTime.now(),
+      forwardDuration: _blockedForwardDuration,
+      impactPause: _blockedImpactPause,
+      returnDuration: _blockedReturnDuration,
+    );
+    if (!_ticker.isActive) _ticker.start();
+    setState(() {});
+  }
+
+  Offset _shakeOffset(DateTime now) {
+    final start = _shakeStartedAt;
+    if (start == null) return Offset.zero;
+    final elapsedMs = now.difference(start).inMilliseconds;
+    if (elapsedMs < 0 || elapsedMs >= _shakeDuration.inMilliseconds) {
+      return Offset.zero;
+    }
+    final t = elapsedMs / _shakeDuration.inMilliseconds;
+    final damp = 1.0 - Curves.easeOut.transform(t);
+    final w = 38.0;
+    final secs = elapsedMs / 1000.0;
+    return Offset(
+      math.sin(secs * w) * 7 * damp,
+      math.cos(secs * w * 1.17) * 6 * damp,
+    );
+  }
+
+  /// 1 at impact, eases to 0 — drives the red edge damage vignette.
+  double _damageFlashStrength(DateTime now) {
+    final start = _damageFlashStartedAt;
+    if (start == null) return 0;
+    final elapsedMs = now.difference(start).inMilliseconds;
+    if (elapsedMs < 0 || elapsedMs >= _damageFlashDuration.inMilliseconds) {
+      return 0;
+    }
+    final t = elapsedMs / _damageFlashDuration.inMilliseconds;
+    return 1.0 - Curves.easeOutCubic.transform(t);
   }
 
   double _distanceToFullyExit(List<Offset> cells, Offset direction) {
@@ -386,7 +559,6 @@ class _GameScreenState extends ConsumerState<GameScreen>
     _syncRemovalFlights(controller, state.arrows);
 
     final occupancy = controller.occupancyMap();
-    final occupiedKeys = occupancy.keys.toSet();
     final arrowCells = <int, List<Offset>>{};
 
     for (int i = 0; i < state.arrows.length; i++) {
@@ -399,65 +571,135 @@ class _GameScreenState extends ConsumerState<GameScreen>
         ? 'Level Cleared'
         : 'Tap free arrow heads to clear';
 
+    final damageStrength = _damageFlashStrength(DateTime.now());
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Pfeile')),
-      body: Column(
+      body: Stack(
         children: [
-          Expanded(
-            child: ClipRect(
-              child: InteractiveViewer(
-                transformationController: _viewerController,
-                constrained: false,
-                boundaryMargin: const EdgeInsets.all(400),
-                minScale: 0.5,
-                maxScale: 4.0,
-                panEnabled: true,
-                scaleEnabled: true,
-                child: GestureDetector(
-                  onTapUp: (details) {
-                    final boardLocal = details.localPosition;
+          Column(
+            children: [
+              Expanded(
+                child: Transform.translate(
+                  offset: _shakeOffset(DateTime.now()),
+                  child: ClipRect(
+                    child: InteractiveViewer(
+                      transformationController: _viewerController,
+                      constrained: false,
+                      boundaryMargin: const EdgeInsets.all(400),
+                      minScale: 0.5,
+                      maxScale: 4.0,
+                      panEnabled: true,
+                      scaleEnabled: true,
+                      child: GestureDetector(
+                        onTapUp: (details) {
+                          final boardLocal = details.localPosition;
 
-                    if (boardLocal.dx < 0 ||
-                        boardLocal.dy < 0 ||
-                        boardLocal.dx >= boardWidth ||
-                        boardLocal.dy >= boardHeight) {
-                      return;
-                    }
+                          if (boardLocal.dx < 0 ||
+                              boardLocal.dy < 0 ||
+                              boardLocal.dx >= boardWidth ||
+                              boardLocal.dy >= boardHeight) {
+                            return;
+                          }
 
-                    final col = (boardLocal.dx / cellSize).floor();
-                    final row = (boardLocal.dy / cellSize).floor();
-                    controller.tapCell(col, row);
-                  },
-                  child: SizedBox(
-                    width: boardWidth,
-                    height: boardHeight,
-                    child: CustomPaint(
-                      painter: _BoardPainter(
-                        rows: GameController.rows,
-                        cols: GameController.cols,
-                        cellSize: cellSize,
-                        arrows: state.arrows,
-                        arrowCells: arrowCells,
-                        occupiedKeys: occupiedKeys,
-                        activeFlights: _activeFlights,
+                          final col = (boardLocal.dx / cellSize).floor();
+                          final row = (boardLocal.dy / cellSize).floor();
+                          final tappedIndex =
+                              controller.topArrowIndexAtCell(col, row);
+                          if (tappedIndex == null) return;
+
+                          if (controller.tapCell(col, row)) {
+                            HapticFeedback.mediumImpact();
+                            return;
+                          }
+                          _startBlockedSlide(tappedIndex, controller);
+                        },
+                        child: SizedBox(
+                          width: boardWidth,
+                          height: boardHeight,
+                          child: CustomPaint(
+                            painter: _BoardPainter(
+                              rows: GameController.rows,
+                              cols: GameController.cols,
+                              cellSize: cellSize,
+                              arrows: state.arrows,
+                              arrowCells: arrowCells,
+                              occupancy: occupancy,
+                              activeFlights: _activeFlights,
+                              blockedFlights: _blockedFlights,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
+              const SizedBox(height: 12),
+              Text(statusText, style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 8),
+              FilledButton(
+                onPressed: controller.newGame,
+                child: const Text('New Game'),
+              ),
+              const SizedBox(height: 12),
+            ],
+          ),
+          if (damageStrength > 0.001)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _DamageEdgeFlashPainter(strength: damageStrength),
+                ),
+              ),
             ),
-          ),
-          const SizedBox(height: 12),
-          Text(statusText, style: Theme.of(context).textTheme.titleMedium),
-          const SizedBox(height: 8),
-          FilledButton(
-            onPressed: controller.newGame,
-            child: const Text('New Game'),
-          ),
-          const SizedBox(height: 12),
         ],
       ),
     );
+  }
+}
+
+/// Red vignette + soft border, strongest at screen edges (blocked-arrow impact).
+class _DamageEdgeFlashPainter extends CustomPainter {
+  final double strength;
+
+  const _DamageEdgeFlashPainter({required this.strength});
+
+  static const Color _redDeep = Color(0xFFB71C1C);
+  static const Color _redMid = Color(0xFFE53935);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (strength <= 0) return;
+    final rect = Offset.zero & size;
+
+    final vignette = Paint()
+      ..shader = RadialGradient(
+        center: Alignment.center,
+        radius: 1.05,
+        colors: [
+          Colors.transparent,
+          Colors.transparent,
+          _redMid.withValues(alpha: 0.14 * strength),
+          _redDeep.withValues(alpha: 0.42 * strength),
+        ],
+        stops: const [0.0, 0.52, 0.8, 1.0],
+      ).createShader(rect);
+    canvas.drawRect(rect, vignette);
+
+    final glow = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 14
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12)
+      ..color = _redDeep.withValues(alpha: 0.28 * strength);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect.deflate(10), const Radius.circular(6)),
+      glow,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _DamageEdgeFlashPainter oldDelegate) {
+    return oldDelegate.strength != strength;
   }
 }
 
@@ -467,8 +709,9 @@ class _BoardPainter extends CustomPainter {
   final double cellSize;
   final List<Arrow> arrows;
   final Map<int, List<Offset>> arrowCells;
-  final Set<String> occupiedKeys;
+  final Map<String, List<int>> occupancy;
   final Map<int, _RemovalFlight> activeFlights;
+  final Map<int, _BlockedSlideFlight> blockedFlights;
 
   const _BoardPainter({
     required this.rows,
@@ -476,8 +719,9 @@ class _BoardPainter extends CustomPainter {
     required this.cellSize,
     required this.arrows,
     required this.arrowCells,
-    required this.occupiedKeys,
+    required this.occupancy,
     required this.activeFlights,
+    required this.blockedFlights,
   });
 
   static const List<Color> _palette = <Color>[
@@ -501,7 +745,9 @@ class _BoardPainter extends CustomPainter {
       ..style = PaintingStyle.fill;
     for (int row = 0; row < rows; row++) {
       for (int col = 0; col < cols; col++) {
-        if (occupiedKeys.contains('$col:$row')) continue;
+        if (_occupancySuppressesDot(col, row, occupancy, blockedFlights, now)) {
+          continue;
+        }
         if (_cellDotSuppressedByActiveRemoval(col, row, activeFlights, now)) {
           continue;
         }
@@ -516,6 +762,7 @@ class _BoardPainter extends CustomPainter {
     for (int index = 0; index < arrows.length; index++) {
       final arrow = arrows[index];
       if (arrow.removed) continue;
+      if (blockedFlights.containsKey(index)) continue;
 
       final cells = arrowCells[index] ?? const <Offset>[];
       if (cells.isEmpty) continue;
@@ -530,6 +777,19 @@ class _BoardPainter extends CustomPainter {
       final color = _palette[index % _palette.length];
       final progress = flight.progress(now);
       final shiftCells = flight.distanceCells * progress;
+      final pixelSamples = _removalPolylinePixelSamples(
+        flight.cells,
+        flight.direction,
+        shiftCells,
+      );
+      _drawRemovalArrow(canvas: canvas, pixelSamples: pixelSamples, color: color);
+    }
+
+    for (final entry in blockedFlights.entries) {
+      final index = entry.key;
+      final flight = entry.value;
+      final color = _palette[index % _palette.length];
+      final shiftCells = flight.shiftAt(now);
       final pixelSamples = _removalPolylinePixelSamples(
         flight.cells,
         flight.direction,
@@ -658,10 +918,14 @@ class _BoardPainter extends CustomPainter {
     if (activeFlights.isNotEmpty || oldDelegate.activeFlights.isNotEmpty) {
       return true;
     }
+    if (blockedFlights.isNotEmpty || oldDelegate.blockedFlights.isNotEmpty) {
+      return true;
+    }
     return oldDelegate.arrows != arrows ||
-        oldDelegate.occupiedKeys != occupiedKeys ||
+        oldDelegate.occupancy != occupancy ||
         oldDelegate.arrowCells != arrowCells ||
-        oldDelegate.activeFlights != activeFlights;
+        oldDelegate.activeFlights != activeFlights ||
+        oldDelegate.blockedFlights != blockedFlights;
   }
 }
 
@@ -687,4 +951,51 @@ class _RemovalFlight {
     if (p >= 1) return 1;
     return Curves.easeIn.transform(p);
   }
+}
+
+class _BlockedSlideFlight {
+  final List<Offset> cells;
+  final Offset direction;
+  final double maxShiftCells;
+  final DateTime startedAt;
+  final Duration forwardDuration;
+  final Duration impactPause;
+  final Duration returnDuration;
+
+  const _BlockedSlideFlight({
+    required this.cells,
+    required this.direction,
+    required this.maxShiftCells,
+    required this.startedAt,
+    required this.forwardDuration,
+    required this.impactPause,
+    required this.returnDuration,
+  });
+
+  DateTime get _forwardEnd => startedAt.add(forwardDuration);
+
+  DateTime get _returnStart => _forwardEnd.add(impactPause);
+
+  DateTime get _returnEnd => _returnStart.add(returnDuration);
+
+  bool forwardEnded(DateTime now) => !now.isBefore(_forwardEnd);
+
+  double shiftAt(DateTime now) {
+    if (now.isBefore(_forwardEnd)) {
+      final ms = now.difference(startedAt).inMilliseconds;
+      final p = (ms / forwardDuration.inMilliseconds).clamp(0.0, 1.0);
+      return maxShiftCells * Curves.easeInOut.transform(p);
+    }
+    if (now.isBefore(_returnStart)) {
+      return maxShiftCells;
+    }
+    if (now.isBefore(_returnEnd)) {
+      final ms = now.difference(_returnStart).inMilliseconds;
+      final p = (ms / returnDuration.inMilliseconds).clamp(0.0, 1.0);
+      return maxShiftCells * (1 - Curves.easeInOut.transform(p));
+    }
+    return 0;
+  }
+
+  bool isComplete(DateTime now) => !now.isBefore(_returnEnd);
 }

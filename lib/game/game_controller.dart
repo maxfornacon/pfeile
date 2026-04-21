@@ -18,8 +18,8 @@ final gameProvider = NotifierProvider<GameController, GameState>(
 /// swapping generators is a matter of changing [_algorithm] and calling
 /// [newGame].
 class GameController extends Notifier<GameState> {
-  static const int rows = 50;
-  static const int cols = 40;
+  static const int rows = 25;
+  static const int cols = 15;
   static const BoardGenerationAlgorithm _defaultAlgorithm =
       BoardGenerationAlgorithm.tiled;
 
@@ -54,19 +54,22 @@ class GameController extends Notifier<GameState> {
   // ---------------------------------------------------------------------------
   // Tap handling
   // ---------------------------------------------------------------------------
-  void tapCell(int col, int row) {
+  /// Returns true if an arrow was removed.
+  bool tapCell(int col, int row) {
     final index = topArrowIndexAtCell(col, row);
-    if (index == null) return;
-    tapArrow(index);
+    if (index == null) return false;
+    return tapArrow(index);
   }
 
-  void tapArrow(int index) {
+  /// Returns true if the arrow was removed (tappable and not already gone).
+  bool tapArrow(int index) {
     final arrows = [...state.arrows];
     final arrow = arrows[index];
-    if (arrow.removed) return;
-    if (!isArrowTappable(index)) return;
+    if (arrow.removed) return false;
+    if (!isArrowTappable(index)) return false;
     arrows[index] = arrow.copyWith(removed: true);
     state = state.copyWith(arrows: arrows);
+    return true;
   }
 
   /// Starts a fresh level. If [algorithm] is provided, the controller
