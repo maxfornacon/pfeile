@@ -574,6 +574,7 @@ class _GameScreenState extends ConsumerState<GameScreen>
     final damageStrength = _damageFlashStrength(DateTime.now());
 
     return Scaffold(
+      backgroundColor: Colors.white,
       body: Stack(
         children: [
           Column(
