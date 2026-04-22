@@ -11,6 +11,9 @@ import '../models/arrow.dart';
 
 const double cellSize = 32.0;
 
+/// Non-zero alpha so [ColoredBox] still hit-tests; effectively invisible.
+const Color _boardHitBaseColor = Color(0x01FFFFFF);
+
 /// Same corner rounding as [_ArrowsPainter] stroke — used for removal sampling.
 Path _buildRoundedArrowPath(List<Offset> points, double cornerRadius) {
   final path = Path();
@@ -317,6 +320,12 @@ class _GameScreenState extends ConsumerState<GameScreen>
   static const Duration _damageFlashDuration = Duration(milliseconds: 900);
   static const double _offBoardMarginCells = 1.0;
 
+  /// Extra space around the board for hit tests (arrows, stroke, and taps in
+  /// the letterbox margin that still “feel” on the edge cell).
+  static const double _boardTouchPad = cellSize;
+
+  final GlobalKey _boardInputStackKey = GlobalKey();
+
   late final Ticker _ticker;
   late final TransformationController _viewerController;
   final Map<int, _RemovalFlight> _activeFlights = <int, _RemovalFlight>{};
@@ -327,9 +336,36 @@ class _GameScreenState extends ConsumerState<GameScreen>
   DateTime? _shakeStartedAt;
   DateTime? _damageFlashStartedAt;
 
+  /// Set on the first arrow tap of the level; until then the stopwatch reads 00:00.000.
+  DateTime? _levelClockStartedAt;
+  int _timePenaltyMs = 0;
+  DateTime? _penaltyIndicatorStartedAt;
+  /// Last [GameState.levelId] applied to local clock / help UI (avoids listen vs. build ordering).
+  int? _syncedLevelId;
+
+  static const Duration _penaltyLabelDuration = Duration(milliseconds: 1100);
+
   static const int _maxHelpLineUses = 3;
   int _helpLineUsesLeft = _maxHelpLineUses;
   bool _showHelpLines = false;
+
+  Size? _lastViewportForCentering;
+
+  /// Sets the initial transform so the content (which may be larger than the
+  /// viewport in either axis) is centered when first shown, and re-centers if
+  /// the viewport size changes (e.g. on rotation). Preserves the user's
+  /// zoom/pan once they interact.
+  void _ensureCenteredTransform(
+    Size viewport,
+    double contentWidth,
+    double contentHeight,
+  ) {
+    if (_lastViewportForCentering == viewport) return;
+    _lastViewportForCentering = viewport;
+    final tx = (viewport.width - contentWidth) / 2;
+    final ty = (viewport.height - contentHeight) / 2;
+    _viewerController.value = Matrix4.identity()..translate(tx, ty);
+  }
 
   @override
   void initState() {
@@ -366,6 +402,8 @@ class _GameScreenState extends ConsumerState<GameScreen>
           _blockedImpactDone.add(index);
           _shakeStartedAt = now;
           _damageFlashStartedAt = now;
+          _timePenaltyMs += 5000;
+          _penaltyIndicatorStartedAt = now;
           HapticFeedback.heavyImpact();
         }
         if (flight.isComplete(now)) blockedDone.add(index);
@@ -378,20 +416,23 @@ class _GameScreenState extends ConsumerState<GameScreen>
 
     final shakeActive = _shakeOffset(now) != Offset.zero;
     final damageActive = _damageFlashStrength(now) > 0.001;
+    final penaltyLabelActive = _penaltyLabelStrength(now) > 0.001;
+    final isWin = ref.read(gameProvider.notifier).isWin;
     final needsTicks = _activeFlights.isNotEmpty ||
         _blockedFlights.isNotEmpty ||
         shakeActive ||
-        damageActive;
+        damageActive ||
+        penaltyLabelActive ||
+        !isWin;
     if (!needsTicks) _ticker.stop();
     setState(() {});
   }
 
   void _syncRemovalFlights(GameController controller, List<Arrow> arrows) {
     final anyRemovedInState = arrows.any((a) => a.removed);
+    // Do not use _blockedFlights here — blocked play has no removed arrows in state.
     if (!anyRemovedInState &&
-        (_knownRemoved.isNotEmpty ||
-            _activeFlights.isNotEmpty ||
-            _blockedFlights.isNotEmpty)) {
+        (_knownRemoved.isNotEmpty || _activeFlights.isNotEmpty)) {
       _knownRemoved.clear();
       _activeFlights.clear();
       _blockedFlights.clear();
@@ -438,6 +479,13 @@ class _GameScreenState extends ConsumerState<GameScreen>
 
     final hasActive = _activeFlights.isNotEmpty || _blockedFlights.isNotEmpty;
     if (hasActive && !_ticker.isActive) _ticker.start();
+
+    // During play, keep the ticker on so the stopwatch advances and the frame
+    // loop runs (it was easy to end up with it stopped after new game / the
+    // reset branch above, which made the first interaction feel flaky).
+    if (!controller.isWin && !_ticker.isActive) {
+      _ticker.start();
+    }
   }
 
   double _maxShiftBeforeCollision(
@@ -532,6 +580,36 @@ class _GameScreenState extends ConsumerState<GameScreen>
     return 1.0 - Curves.easeOutCubic.transform(t);
   }
 
+  /// 1 when "+5" appears, eases to 0 (blocked-arrow impact / penalty feedback).
+  double _penaltyLabelStrength(DateTime now) {
+    final start = _penaltyIndicatorStartedAt;
+    if (start == null) return 0;
+    final elapsedMs = now.difference(start).inMilliseconds;
+    if (elapsedMs < 0 ||
+        elapsedMs >= _penaltyLabelDuration.inMilliseconds) {
+      return 0;
+    }
+    final t = elapsedMs / _penaltyLabelDuration.inMilliseconds;
+    return 1.0 - Curves.easeOutCubic.transform(t);
+  }
+
+  int _displayElapsedMs(DateTime now) {
+    final start = _levelClockStartedAt;
+    if (start == null) return 0;
+    return now.difference(start).inMilliseconds + _timePenaltyMs;
+  }
+
+  String _formatStopwatch(int totalMs) {
+    var ms = totalMs;
+    if (ms < 0) ms = 0;
+    final m = ms ~/ 60000;
+    final s = (ms % 60000) ~/ 1000;
+    final frac = ms % 1000;
+    return '${m.toString().padLeft(2, '0')}:'
+        '${s.toString().padLeft(2, '0')}.'
+        '${frac.toString().padLeft(3, '0')}';
+  }
+
   double _distanceToFullyExit(List<Offset> cells, Offset direction) {
     final maxTravel =
         cells.length + GameController.rows + GameController.cols + 4.0;
@@ -559,14 +637,23 @@ class _GameScreenState extends ConsumerState<GameScreen>
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(gameProvider);
-    ref.listen(gameProvider.select((s) => s.levelId), (prev, next) {
-      if (prev != null && prev != next) {
-        setState(() {
-          _helpLineUsesLeft = _maxHelpLineUses;
-          _showHelpLines = false;
-        });
+    if (_syncedLevelId != state.levelId) {
+      final hadPreviousLevel = _syncedLevelId != null;
+      _syncedLevelId = state.levelId;
+      if (hadPreviousLevel) {
+        _helpLineUsesLeft = _maxHelpLineUses;
+        _showHelpLines = false;
+        _levelClockStartedAt = null;
+        _timePenaltyMs = 0;
+        _penaltyIndicatorStartedAt = null;
+        _knownRemoved.clear();
+        _activeFlights.clear();
+        _blockedFlights.clear();
+        _blockedImpactDone.clear();
+        _shakeStartedAt = null;
+        _damageFlashStartedAt = null;
       }
-    });
+    }
     final controller = ref.read(gameProvider.notifier);
     _syncRemovalFlights(controller, state.arrows);
 
@@ -583,7 +670,24 @@ class _GameScreenState extends ConsumerState<GameScreen>
         ? 'Level Cleared'
         : 'Tap free arrow heads to clear';
 
-    final damageStrength = _damageFlashStrength(DateTime.now());
+    final clockNow = DateTime.now();
+    final damageStrength = _damageFlashStrength(clockNow);
+    final penaltyStrength = _penaltyLabelStrength(clockNow);
+    final timerText = _formatStopwatch(_displayElapsedMs(clockNow));
+    final baseTimerStyle = Theme.of(context).textTheme.headlineMedium?.copyWith(
+          fontWeight: FontWeight.w600,
+          fontFeatures: const [FontFeature.tabularFigures()],
+          letterSpacing: 0.5,
+        ) ??
+        const TextStyle(
+          fontWeight: FontWeight.w600,
+          fontFeatures: [FontFeature.tabularFigures()],
+        );
+    final timerColor = Color.lerp(
+      baseTimerStyle.color ?? const Color(0xFF1C1B1F),
+      const Color(0xFFC62828),
+      damageStrength,
+    )!;
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -617,6 +721,21 @@ class _GameScreenState extends ConsumerState<GameScreen>
         children: [
           Column(
             children: [
+              SafeArea(
+                bottom: false,
+                child: Padding(
+                  padding:
+                      const EdgeInsets.only(top: 8, left: 16, right: 16),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: Text(
+                      timerText,
+                      textAlign: TextAlign.center,
+                      style: baseTimerStyle.copyWith(color: timerColor),
+                    ),
+                  ),
+                ),
+              ),
               Expanded(
                 child: Transform.translate(
                   offset: _shakeOffset(DateTime.now()),
@@ -624,12 +743,25 @@ class _GameScreenState extends ConsumerState<GameScreen>
                     child: LayoutBuilder(
                       builder: (context, constraints) {
                         final vp = constraints.biggest;
-                        final ox = (vp.width - boardWidth) / 2;
-                        final oy = (vp.height - boardHeight) / 2;
-                        final boardOrigin = Offset(ox, oy);
+                        // Content (board + touch pad) sized to always contain every
+                        // cell inside the hit-test region. `constrained: false`
+                        // lets `InteractiveViewer` hand unbounded constraints to
+                        // this child, so `RenderBox.hitTest` no longer rejects
+                        // taps on cells that would fall outside the viewport
+                        // size when zoomed/panned (previously caused edge-of-grid
+                        // taps to be silently dropped).
+                        final contentWidth =
+                            boardWidth + 2 * _boardTouchPad;
+                        final contentHeight =
+                            boardHeight + 2 * _boardTouchPad;
+                        _ensureCenteredTransform(vp, contentWidth, contentHeight);
+                        const boardOrigin = Offset(
+                          _boardTouchPad,
+                          _boardTouchPad,
+                        );
                         return InteractiveViewer(
                           transformationController: _viewerController,
-                          constrained: true,
+                          constrained: false,
                           clipBehavior: Clip.none,
                           boundaryMargin: const EdgeInsets.all(400),
                           minScale: 0.5,
@@ -637,14 +769,14 @@ class _GameScreenState extends ConsumerState<GameScreen>
                           panEnabled: true,
                           scaleEnabled: true,
                           child: SizedBox(
-                            width: vp.width,
-                            height: vp.height,
+                            width: contentWidth,
+                            height: contentHeight,
                             child: Stack(
                               clipBehavior: Clip.none,
                               children: [
                                 Positioned(
-                                  left: ox,
-                                  top: oy,
+                                  left: _boardTouchPad,
+                                  top: _boardTouchPad,
                                   width: boardWidth,
                                   height: boardHeight,
                                   child: CustomPaint(
@@ -673,48 +805,122 @@ class _GameScreenState extends ConsumerState<GameScreen>
                                       ),
                                     ),
                                   ),
-                                Positioned(
-                                  left: ox,
-                                  top: oy,
-                                  width: boardWidth,
-                                  height: boardHeight,
+                                Positioned.fill(
                                   child: GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
                                     onTapUp: (details) {
-                                      final boardLocal = details.localPosition;
-
-                                      final col =
-                                          (boardLocal.dx / cellSize).floor();
-                                      final row =
-                                          (boardLocal.dy / cellSize).floor();
-                                      final tappedIndex = controller
-                                          .topArrowIndexAtCell(col, row);
+                                      final box = _boardInputStackKey
+                                          .currentContext
+                                          ?.findRenderObject() as RenderBox?;
+                                      if (box == null || !box.hasSize) return;
+                                      var p = box
+                                          .globalToLocal(details.globalPosition);
+                                      p = Offset(
+                                        p.dx
+                                            .clamp(0.0, box.size.width)
+                                            .toDouble(),
+                                        p.dy
+                                            .clamp(0.0, box.size.height)
+                                            .toDouble(),
+                                      );
+                                      var bx = p.dx - _boardTouchPad;
+                                      var by = p.dy - _boardTouchPad;
+                                      bx = bx.clamp(0.0, boardWidth - 1e-9);
+                                      by = by.clamp(0.0, boardHeight - 1e-9);
+                                      final col = math.min(
+                                        GameController.cols - 1,
+                                        math.max(
+                                          0,
+                                          (bx / cellSize).floor(),
+                                        ),
+                                      );
+                                      final row = math.min(
+                                        GameController.rows - 1,
+                                        math.max(
+                                          0,
+                                          (by / cellSize).floor(),
+                                        ),
+                                      );
+                                      final tappedIndex =
+                                          controller.topArrowIndexAtCell(
+                                        col,
+                                        row,
+                                      );
                                       if (tappedIndex == null) return;
 
                                       if (_showHelpLines) {
                                         setState(() => _showHelpLines = false);
                                       }
 
+                                      _levelClockStartedAt ??= DateTime.now();
+
                                       if (controller.tapCell(col, row)) {
                                         HapticFeedback.mediumImpact();
                                         return;
                                       }
                                       _startBlockedSlide(
-                                          tappedIndex, controller);
+                                        tappedIndex,
+                                        controller,
+                                      );
                                     },
-                                    child: CustomPaint(
-                                      painter: _ArrowsPainter(
-                                        rows: GameController.rows,
-                                        cols: GameController.cols,
-                                        cellSize: cellSize,
-                                        arrows: state.arrows,
-                                        arrowCells: arrowCells,
-                                        activeFlights: _activeFlights,
-                                        blockedFlights: _blockedFlights,
-                                      ),
+                                    child: Stack(
+                                      key: _boardInputStackKey,
+                                      clipBehavior: Clip.none,
+                                      fit: StackFit.expand,
+                                      children: [
+                                        Positioned.fill(
+                                          child: ColoredBox(
+                                            color: _boardHitBaseColor,
+                                          ),
+                                        ),
+                                        Positioned(
+                                          left: _boardTouchPad,
+                                          top: _boardTouchPad,
+                                          width: boardWidth,
+                                          height: boardHeight,
+                                          child: CustomPaint(
+                                            painter: _ArrowsPainter(
+                                              rows: GameController.rows,
+                                              cols: GameController.cols,
+                                              cellSize: cellSize,
+                                              arrows: state.arrows,
+                                              arrowCells: arrowCells,
+                                              activeFlights: _activeFlights,
+                                              blockedFlights: _blockedFlights,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 ),
+                                if (penaltyStrength > 0.001)
+                                  Positioned.fill(
+                                    child: IgnorePointer(
+                                      child: Center(
+                                        child: Opacity(
+                                          opacity: penaltyStrength,
+                                          child: Transform.scale(
+                                            scale: 1.0 +
+                                                Curves.easeIn.transform(
+                                                  (1.0 - penaltyStrength)
+                                                      .clamp(0.0, 1.0),
+                                                ) *
+                                                    1.75,
+                                            child: Text(
+                                              '+5',
+                                              style: TextStyle(
+                                                fontSize: 88,
+                                                fontWeight: FontWeight.w300,
+                                                height: 1.0,
+                                                letterSpacing: -1.5,
+                                                color: const Color(0xFFC62828),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
                               ],
                             ),
                           ),

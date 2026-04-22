@@ -18,8 +18,8 @@ final gameProvider = NotifierProvider<GameController, GameState>(
 /// swapping generators is a matter of changing [_algorithm] and calling
 /// [newGame].
 class GameController extends Notifier<GameState> {
-  static const int rows = 25;
-  static const int cols = 15;
+  static const int rows = 50;
+  static const int cols = 50;
   static const BoardGenerationAlgorithm _defaultAlgorithm =
       BoardGenerationAlgorithm.tiled;
 
@@ -143,12 +143,10 @@ class GameController extends Notifier<GameState> {
     if (arrow.points.isEmpty) return cells;
 
     if (arrow.points.length == 1) {
-      return [
-        Offset(
-          arrow.points.first.dx.roundToDouble(),
-          arrow.points.first.dy.roundToDouble(),
-        ),
-      ];
+      final p = arrow.points.first;
+      final x = p.dx.round().clamp(0, cols - 1);
+      final y = p.dy.round().clamp(0, rows - 1);
+      return [Offset(x.toDouble(), y.toDouble())];
     }
 
     for (int i = 0; i < arrow.points.length - 1; i++) {
@@ -168,8 +166,10 @@ class GameController extends Notifier<GameState> {
 
       for (int step = 0; step <= steps; step++) {
         if (i > 0 && step == 0) continue;
-        final x = startX + (stepX * step);
-        final y = startY + (stepY * step);
+        var x = startX + (stepX * step);
+        var y = startY + (stepY * step);
+        x = x.clamp(0, cols - 1);
+        y = y.clamp(0, rows - 1);
         cells.add(Offset(x.toDouble(), y.toDouble()));
       }
     }
