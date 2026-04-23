@@ -18,8 +18,8 @@ final gameProvider = NotifierProvider<GameController, GameState>(
 /// swapping generators is a matter of changing [_algorithm] and calling
 /// [newGame].
 class GameController extends Notifier<GameState> {
-  static const int rows = 50;
-  static const int cols = 50;
+  static const int rows = 31;
+  static const int cols = 15;
   static const BoardGenerationAlgorithm _defaultAlgorithm =
       BoardGenerationAlgorithm.tiled;
 

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:pfeile/screens/game_screen.dart';
+import 'package:pfeile/theme/app_colors.dart';
 
 void main() {
   runApp(
@@ -20,6 +21,7 @@ class MyApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        scaffoldBackgroundColor: AppColors.scaffoldBackground,
       ),
       home: const GameScreen(),
     );
